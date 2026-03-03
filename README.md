@@ -71,7 +71,7 @@ The below example designs the six CDRs separately for the `7DK2_AB_C` antibody-a
 
 ```bash
 python design_pdb.py ./data/examples/7DK2_AB_C.pdb \
-	--config ./config/test/codesign_single.yml
+	--config ./configs/test/codesign_single.yml
 ```
 
 ### Antigen Only
@@ -92,7 +92,7 @@ Below is an example that designs antibodies for SARS-CoV-2 Omicron RBD.
 ```python
 python design_dock.py \
 	--antigen ./data/examples/Omicron_RBD.pdb \
-	--config ./config/test/codesign_multicdrs.yml
+	--config ./configs/test/codesign_multicdrs.yml
 ```
 
 ## Train
