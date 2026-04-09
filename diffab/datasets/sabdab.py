@@ -139,7 +139,11 @@ def preprocess_sabdab_structure(task):
     pdb_path = task['pdb_path']
 
     parser = PDB.PDBParser(QUIET=True)
-    model = parser.get_structure(id, pdb_path)[0]
+    try:
+        model = parser.get_structure(id, pdb_path)[0]
+    except Exception as e:
+        logging.warning(f'[{entry["id"]}] Failed to parse PDB {pdb_path}: {e}')
+        return None
 
     parsed = {
         'id': entry['id'],
