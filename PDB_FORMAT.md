@@ -5,6 +5,10 @@ Notes on reading the protein structure files used by DiffAb, using
 Files in the SAbDab dataset (`data/all_structures/chothia/*.pdb`) and the model's
 own output (`results/.../0000.pdb`) use the same format.
 
+For what the model puts *inside* those files — the `(R, t, s)` diffusion output,
+why sampled CDRs are backbone-only, and the relax/eval pipeline — see
+[`HOW_DIFFAB_WORKS.md`](HOW_DIFFAB_WORKS.md).
+
 ## The one rule that matters
 
 **PDB is fixed-width, defined by byte position.** Every `ATOM` line is exactly 80
@@ -204,6 +208,196 @@ to report. Generated files therefore contain no waters, no glycans, and no `CRYS
 but preserve chain IDs and residue numbers so a design can be diffed against
 `reference.pdb` position by position.
 
+## Antibody numbering: locating the Fv and the CDRs
+
+The columns above say *where* a residue number sits. They say nothing about what it
+means. For antibodies the numbers themselves carry meaning — but only after
+renumbering.
+
+### The input is a Fab; `reference.pdb` is the Fv
+
+DiffAb does not model what you hand it. Compare the example input against the
+`reference.pdb` written into the results directory:
+
+| | `data/examples/7DK2_AB_C.pdb` | `results/.../reference.pdb` |
+|---|---|---|
+| chain A (heavy) | 223 residues, numbered 1–223 | 120 residues, Chothia 1–113 |
+| chain B (light) | 214 residues, numbered 1–214 | 106 residues, Chothia 1–106 |
+| chain C (antigen) | 191 residues, 336–526 | 191 residues, **336–526 unchanged** |
+
+Chain A lost its CH1 domain, chain B lost CL, and the antigen passed through
+untouched — it keeps its deposited numbering, so antigen and antibody residue
+numbers in the same file come from different coordinate systems entirely.
+
+`113` and `106` are *last residue numbers*, not counts. Chain A holds 120 residues
+within 113 numbers because Chothia numbering absorbs the extra ones as insertion
+codes in column 27 — here `52A`, `82A/82B/82C`, `100A/100B/100C`. **Never infer a
+residue count from the final residue number in an antibody file**, and never count
+residues by numbering alone.
+
+### Chothia renumbering is an external standard, not DiffAb's
+
+DiffAb contributes only the ~80-line wrapper in
+[`diffab/tools/renumber/run.py`](diffab/tools/renumber/run.py). Underneath:
+
+- **Chothia numbering** — Chothia & Lesk (1987), refined by Al-Lazikani et al. (1997).
+  One of roughly five established schemes (Kabat, Chothia, Martin/"enhanced Chothia",
+  IMGT, AHo), each with *different* CDR boundaries. Chothia is structure-based;
+  Kabat is sequence-hypervariability-based.
+- **ANARCI** — Dunbar & Deane (2016), Oxford OPIG. HMMER germline alignment, the de
+  facto tool for applying any of those schemes. Same group maintains SAbDab, which is
+  why SAbDab ships pre-renumbered `chothia/` and `imgt/` directories.
+- **abnumber** — the Python wrapper over ANARCI that DiffAb actually calls.
+
+⚠️ The hardcoded ranges below are **Chothia-specific**. Passing `--no_renumber` on an
+IMGT- or Kabat-numbered file masks the wrong residues silently — no error, just a
+design in the wrong place. `scheme='chothia'` is Chothia proper, not Martin.
+
+### How the Fv boundary is found
+
+One `abnumber` call does three jobs ([`run.py:16`](diffab/tools/renumber/run.py)):
+
+```python
+abchain = abnumber.Chain(seq, scheme='chothia')
+offset  = seq.index(abchain.seq)
+```
+
+| Return value | Used for |
+|---|---|
+| `abchain.seq` | the recognized Fv subsequence. Residues outside it get `numbers[i] = None` and are **dropped** by `renumber_biopython_chain()` (`run.py:36-37`) — this is the actual Fv crop, no fixed cutoff involved |
+| `abchain.chain_type` | `'H'` vs `'K'/'L'`, so heavy/light are auto-detected (`run.py:57-61`) and `--heavy`/`--light` get defaulted (`design_for_pdb.py:110-113`) |
+| `ChainParseError` | chain has no valid Fv → copied unchanged, classified `other_chains` → **the antigen** |
+
+The renumbered intermediate is written next to the input as
+`<name>_chothia.pdb` (`design_for_pdb.py:107`), then that file — not the original —
+is what gets parsed.
+
+A **second, redundant crop** lives in
+[`diffab/datasets/custom.py:42,51`](diffab/datasets/custom.py):
+
+```python
+max_resseq = 113    # Chothia, end of Heavy chain Fv
+max_resseq = 106    # Chothia, end of Light chain Fv
+```
+
+This one matters on the `--no_renumber` path: SAbDab's `chothia/*.pdb` files number
+the *whole* Fab, constant domain continuing past 113, so this cut is what removes
+CH1/CL when ANARCI hasn't already done it.
+
+### CDR positions are fixed constants
+
+Native CDR indices and lengths differ per antibody. Renumbering is what erases that:
+after Chothia renumbering, the boundaries are the same integers for every antibody,
+so they can be hardcoded
+([`constants.py:13-19`](diffab/utils/protein/constants.py)):
+
+```python
+class ChothiaCDRRange:
+    H1 = (26, 32);  H2 = (52, 56);  H3 = (95, 102)
+    L1 = (24, 34);  L2 = (50, 56);  L3 = (89, 97)
+```
+
+What varies between antibodies is CDR **length**, absorbed by insertion codes rather
+than by shifting boundaries. For 7DK2:
+
+| CDR | Chain | Range | Slots | Residues | Insertions |
+|---|---|---|---|---|---|
+| H_CDR1 | A | 26–32 | 7 | 7 | — |
+| H_CDR2 | A | 52–56 | 5 | 6 | `52A` |
+| H_CDR3 | A | 95–102 | 8 | 11 | `100A`, `100B`, `100C` |
+| L_CDR1 | B | 24–34 | 11 | 11 | — |
+| L_CDR2 | B | 50–56 | 7 | 7 | — |
+| L_CDR3 | B | 89–97 | 9 | 9 | — |
+
+### `metadata.json` is generated at runtime, not supplied
+
+It does **not** come from SAbDab. `data/sabdab_summary_all.tsv` carries
+`pdb, Hchain, Lchain, antigen_chain, resolution, date, …` — chain IDs and split
+metadata, **no CDR positions at all**.
+
+`create_data_variants()` (`design_for_pdb.py:22-93`) applies `MaskSingleCDR` per CDR,
+then reads the boundaries back off the resulting mask
+([`inference.py:28-34`](diffab/utils/inference.py)):
+
+```python
+loop_idx = torch.arange(loop_flag.size(0))[data['generate_flag']]
+idx_first, idx_last = loop_idx.min().item(), loop_idx.max().item()
+```
+
+So `residue_first`/`residue_last` are a *readback of what was actually diffused* —
+the **observed** endpoints, not the constants. If Chothia position 26 were absent from
+the structure, `residue_first` would read `A 27`.
+
+### Reading the output: only the target CDR changes
+
+Every sample file (`H_CDR1/0000.pdb`, …) contains the **entire complex**. The antigen
+and the non-target antibody chain are byte-identical copies of `reference.pdb`; so is
+all of the target chain outside the CDR. Diffing a sample against `reference.pdb`
+yields changes confined exactly to that CDR's range — both coordinates and residue
+identities, since `codesign` mode designs sequence and structure jointly.
+
+To extract the designed loop, drive it off `metadata.json` rather than hardcoding, and
+slice by residue number *plus* insertion code — a `95–102` range covers 11 residues
+when `100A/100B/100C` are present:
+
+```python
+import json, glob
+m = json.load(open('metadata.json'))
+for it in m['items']:
+    ch, lo, hi = it['residue_first'][0], it['residue_first'][1], it['residue_last'][1]
+    for f in sorted(glob.glob(f"{it['tag']}/*.pdb")):
+        seen = []
+        for l in open(f):
+            if l.startswith('ATOM') and l[21] == ch and lo <= int(l[22:26]) <= hi:
+                if l[22:27] not in seen:      # cols 23-27 = resSeq + iCode
+                    seen.append(l[22:27])
+        print(it['tag'], f, len(seen))
+```
+
+### A CDR can be *shorter* than its range — and nothing warns you
+
+Insertion codes handle longer loops; **gaps** handle shorter ones. The numbering
+scheme does not require every slot in a range to be occupied. Two causes, which the
+code cannot distinguish:
+
+1. **Germline deletions** — a 5-residue CDR-H3 simply leaves 96–100 empty.
+2. **Unresolved density** — flexible loop tips, CDR-H3 especially, are often missing
+   from crystal structures.
+
+The masking code is gap-tolerant by construction (`sabdab.py:79-83`), because it
+iterates over *observed* residues rather than over the range:
+
+```python
+for position, idx in seq_map.items():
+    cdr_type = constants.ChothiaCDRRange.to_cdr('H', position[1])
+    if cdr_type is not None:
+        cdr_flag[idx] = cdr_type
+```
+
+An absent position never gets flagged. No error, no warning. The only filters are
+`cdr3_length > 30` → drop and `cdr3_length == 0` → drop (`sabdab.py:92-101`); **there
+is no minimum length beyond zero**, so a 3-residue H3 passes silently.
+
+**The consequence:** DiffAb generates exactly as many residues as were masked, and
+gaps shrink the mask. A CDR-H3 with three disordered residues gets a *9*-residue loop
+designed where the real one has 12 — the model does not fill the gap or rebuild the
+missing backbone. In `codesign_single` mode the length is pinned to the mask, since
+`augmentation=False` (`design_for_pdb.py:31`) means `random_shrink_extend` never fires
+(`mask.py:62-63` — training-time only).
+
+So check occupancy before trusting a design: compare the `residue_first`→`residue_last`
+span in `metadata.json` against the residue count actually present in that range. If
+the count falls short of the span, you have gaps — pick a structure with a complete
+loop, or pre-fill it with a loop modeler.
+
 ## Reference
 
-Official specification: [PDB File Format v3.3](https://www.wwpdb.org/documentation/file-format-content/format33/v3.3.html)
+PDB format: [official specification v3.3](https://www.wwpdb.org/documentation/file-format-content/format33/v3.3.html)
+
+Antibody numbering:
+
+- Chothia, C. & Lesk, A. M. (1987) *Canonical structures for the hypervariable regions of immunoglobulins.* J Mol Biol 196:901-917.
+- Al-Lazikani, B., Lesk, A. M. & Chothia, C. (1997) *Standard conformations for the canonical structures of immunoglobulins.* J Mol Biol 273:927-948.
+- Dunbar, J. & Deane, C. M. (2016) *ANARCI: antigen receptor numbering and receptor classification.* Bioinformatics 32:298-300.
+- [abnumber](https://github.com/prihoda/AbNumber) — the Python wrapper DiffAb calls.
+- [SAbDab](https://opig.stats.ox.ac.uk/webapps/sabdab) — source of `data/all_structures/chothia/`.
