@@ -75,13 +75,19 @@ def _backbone_coords(reslist):
     return coords, n_incomplete
 
 
+def peptide_bond_lengths(reslist):
+    """C(i)--N(i+1) distances along `reslist`, one per consecutive pair."""
+    res, _ = _backbone_coords(reslist)
+    return np.array([np.linalg.norm(res[i + 1]['N'] - res[i]['C']) for i in range(len(res) - 1)])
+
+
 def backbone_geometry(reslist):
     """Bond lengths, bond angles and peptide planarity over `reslist`."""
     res, n_incomplete = _backbone_coords(reslist)
     if len(res) == 0:
         return {}
 
-    pep = np.array([np.linalg.norm(res[i + 1]['N'] - res[i]['C']) for i in range(len(res) - 1)])
+    pep = peptide_bond_lengths(reslist)
     n_ca = np.array([np.linalg.norm(r['CA'] - r['N']) for r in res])
     ca_c = np.array([np.linalg.norm(r['C'] - r['CA']) for r in res])
     c_o = np.array([np.linalg.norm(r['O'] - r['C']) for r in res])

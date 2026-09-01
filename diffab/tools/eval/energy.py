@@ -14,9 +14,23 @@ pyrosetta.init(' '.join([
 from diffab.tools.eval.base import EvalTask
 
 
+def _interface_analyzer(interface):
+    """InterfaceAnalyzerMover for a chain-pair spec such as 'AB_C'.
+
+    Older PyRosetta took the spec in the constructor; 2025+ builds dropped that
+    overload and expose it only through set_interface().
+    """
+    try:
+        return InterfaceAnalyzerMover(interface)
+    except TypeError:
+        mover = InterfaceAnalyzerMover()
+        mover.set_interface(interface)
+        return mover
+
+
 def pyrosetta_interface_energy(pdb_path, interface):
     pose = pyrosetta.pose_from_pdb(pdb_path)
-    mover = InterfaceAnalyzerMover(interface)
+    mover = _interface_analyzer(interface)
     mover.set_pack_separated(True)
     mover.apply(pose)
     return pose.scores['dG_separated']

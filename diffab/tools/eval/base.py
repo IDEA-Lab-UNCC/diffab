@@ -123,3 +123,54 @@ class TaskScanner:
                 ))
                 self.visited.add(fpath)
         return tasks
+
+
+def run_dir(task: 'EvalTask'):
+    """Directory holding the run's metadata.json, one level above the CDR dirs."""
+    return os.path.dirname(os.path.dirname(task.in_path))
+
+
+EVAL_SUBDIR = 'evaluation'
+
+
+def evaluation_dir(base, create=True):
+    """`<base>/evaluation` -- where every evaluation artefact is written.
+
+    Keeps generated structures and evaluation output from sharing a directory,
+    so a run directory stays browsable as model output.
+    """
+    path = os.path.join(base, EVAL_SUBDIR)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def add_selection_args(parser):
+    """Filters shared by the evaluation runners.
+
+    Scoping by `--root` already works at any depth, because each structure's
+    metadata is looked up relative to the PDB file rather than to the root.
+    These filters are for picking a subset out of a tree that is scanned as a
+    whole.
+    """
+    parser.add_argument('--method', type=str, default=None,
+                        help='comma-separated substrings; keep matching methods only')
+    parser.add_argument('--structure', type=str, default=None,
+                        help='comma-separated substrings, e.g. 7DK2,5XXX')
+    parser.add_argument('--cdr', type=str, default=None,
+                        help='comma-separated substrings, e.g. H_CDR3,L_CDR1')
+
+
+def _keep(value, spec):
+    if not spec:
+        return True
+    return any(p in str(value).lower() for p in spec.lower().split(','))
+
+
+def filter_tasks(tasks, args):
+    return [
+        t for t in tasks
+        if _keep(t.method, getattr(args, 'method', None))
+        and _keep(t.structure, getattr(args, 'structure', None))
+        and _keep(t.cdr, getattr(args, 'cdr', None))
+    ]

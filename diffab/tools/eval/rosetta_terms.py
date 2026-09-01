@@ -15,7 +15,10 @@ import os
 import argparse
 import pandas as pd
 
-from diffab.tools.eval.base import EvalTask, TaskScanner
+from diffab.tools.eval.base import (
+    EvalTask, TaskScanner, add_selection_args, evaluation_dir, filter_tasks,
+    run_dir,
+)
 
 # Terms reported, in the order they are written to the CSV.
 TERMS = (
@@ -118,13 +121,20 @@ def main():
     parser.add_argument('--root', type=str, default='./results')
     parser.add_argument('--pfx', type=str, default='rosetta')
     parser.add_argument('--out', type=str, default=None)
+    parser.add_argument('--layout', choices=('flat', 'per_run', 'both'), default='per_run')
+    add_selection_args(parser)
     args = parser.parse_args()
 
     tasks = TaskScanner(root=args.root, postfix=args.pfx).scan()
     if not tasks:
         print(f'No structures matching *_{args.pfx}.pdb found under {args.root}.')
         return
-    print(f'Found {len(tasks)} structures.')
+    selected = filter_tasks(tasks, args)
+    if not selected:
+        print(f'{len(tasks)} structures found, none matched the selection filters.')
+        return
+    print(f'Found {len(tasks)} structures, {len(selected)} selected.')
+    tasks = selected
 
     native_cache = {}
     rows = []
@@ -134,22 +144,32 @@ def main():
         if key not in native_cache:
             native_cache[key] = native_rosetta_terms(task)
         task.scores.update(native_cache[key])
-        rows.append(task.to_report_dict())
+        row = task.to_report_dict()
+        row['run_dir'] = run_dir(task)
+        rows.append(row)
         if i % 50 == 0:
             print(f'  {i}/{len(tasks)}')
 
     table = pd.DataFrame(rows)
-    out_dir = args.out or args.root
-    per_design = os.path.join(out_dir, 'terms_per_design.csv')
-    table.to_csv(per_design, index=False, float_format='%.6f')
+    print()
 
-    cols = [c for c in table.columns if c.startswith('term_') or c.startswith('ref_term_')]
-    summary = table.groupby(['method', 'structure', 'cdr'])[cols].mean()
-    summary_path = os.path.join(out_dir, 'terms_summary.csv')
-    summary.to_csv(summary_path, float_format='%.4f')
+    def write(subset, base):
+        out_dir = evaluation_dir(base)
+        per_design = os.path.join(out_dir, 'terms_per_design.csv')
+        subset.drop(columns=['run_dir']).to_csv(per_design, index=False, float_format='%.6f')
+        cols = [c for c in subset.columns
+                if c.startswith('term_') or c.startswith('ref_term_')]
+        summary_path = os.path.join(out_dir, 'terms_summary.csv')
+        subset.groupby(['method', 'structure', 'cdr'])[cols].mean().to_csv(
+            summary_path, float_format='%.4f')
+        print(f'Wrote {per_design}')
+        print(f'Wrote {summary_path}')
 
-    print(f'\nWrote {per_design}')
-    print(f'Wrote {summary_path}')
+    if args.layout in ('per_run', 'both'):
+        for directory, subset in table.groupby('run_dir'):
+            write(subset, directory)
+    if args.layout in ('flat', 'both'):
+        write(table, args.out or args.root)
 
 
 if __name__ == '__main__':
