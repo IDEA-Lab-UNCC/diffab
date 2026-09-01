@@ -37,6 +37,22 @@ TERMS = (
     'ref',              # composition-dependent reference energy
 )
 
+# Terms written to the CSVs, each immediately followed by its native control.
+# Everything in TERMS is computed (it all comes from one scoring pass, so the
+# extra terms are free) but only these are recorded -- add a name here to report
+# more. `hbond_sr_bb` / `hbond_lr_bb` are deliberately absent: Rosetta keeps
+# those two in separate whole-pose containers and never attributes them to
+# individual residues, so a per-residue query returns 0.0 for any structure.
+REPORT_ORDER = (
+    'total_no_ref',     # the number to compare designs on
+    'total',            # excludes backbone H-bonds, see module docstring
+    'total_per_res',
+    'rama_prepro',      # backbone dihedral legality
+    'fa_rep',           # steric strain; more sensitive than a hard clash cutoff
+    'p_aa_pp',          # is the designed residue type compatible with its backbone
+    'n_res',
+)
+
 _INITIALISED = False
 _SCOREFXN = None
 
@@ -116,6 +132,16 @@ def native_rosetta_terms(task: EvalTask):
     return {'ref_' + k: v for k, v in scores.items()}
 
 
+def paired_columns(columns):
+    """`term_x`, `ref_term_x`, `term_y`, `ref_term_y`, ... in REPORT_ORDER."""
+    ordered = []
+    for name in REPORT_ORDER:
+        for candidate in (f'term_{name}', f'ref_term_{name}'):
+            if candidate in columns:
+                ordered.append(candidate)
+    return ordered
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='./results')
@@ -155,13 +181,15 @@ def main():
 
     def write(subset, base):
         out_dir = evaluation_dir(base)
+        cols = paired_columns(subset.columns)
+        keys = ['method', 'structure', 'cdr']
+
         per_design = os.path.join(out_dir, 'terms_per_design.csv')
-        subset.drop(columns=['run_dir']).to_csv(per_design, index=False, float_format='%.6f')
-        cols = [c for c in subset.columns
-                if c.startswith('term_') or c.startswith('ref_term_')]
+        subset[keys + ['filename'] + cols].to_csv(
+            per_design, index=False, float_format='%.6f')
+
         summary_path = os.path.join(out_dir, 'terms_summary.csv')
-        subset.groupby(['method', 'structure', 'cdr'])[cols].mean().to_csv(
-            summary_path, float_format='%.4f')
+        subset.groupby(keys)[cols].mean().to_csv(summary_path, float_format='%.4f')
         print(f'Wrote {per_design}')
         print(f'Wrote {summary_path}')
 

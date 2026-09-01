@@ -13,6 +13,7 @@ reference-free metrics and how to run them.
 - [Reading the column names](#reading-the-column-names)
 - [What is measured, and over which residues](#what-is-measured-and-over-which-residues)
 - [Column reference: validity](#column-reference-validity)
+- [Column reference: terms](#column-reference-terms)
 - [Thresholds and constants](#thresholds-and-constants)
 - [Caveats](#caveats)
 - [Why these metrics exist](#why-these-metrics-exist)
@@ -27,7 +28,7 @@ generated structures.
 | `summary.csv` | `rmsd`, `seqid` (= AAR), `dG_gen`, `dG_ref`, `ddG` | `diffab.tools.eval.run` |
 | `validity_per_design.csv` | 67 columns; one row per design | `diffab.tools.eval.validate` |
 | `validity_summary.csv` | 31 columns; one row per `(method, structure, cdr)` | `diffab.tools.eval.validate` |
-| `terms_per_design.csv` | per-residue `ref2015` term breakdown, one row per design | `diffab.tools.eval.rosetta_terms` |
+| `terms_per_design.csv` | `ref2015` term breakdown over the CDR, one row per design | `diffab.tools.eval.rosetta_terms` |
 | `terms_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.rosetta_terms` |
 | `peptide_bond_distribution.png` | bond-length histogram, one panel per CDR | `diffab.tools.eval.plot_geometry` |
 
@@ -447,6 +448,132 @@ geometry block.
 
 `ref_shift_*` is measured `REF1.pdb` → `REF1_<pfx>.pdb`.
 
+## Column reference: terms
+
+`terms_summary.csv` — one row per `(method, structure, cdr)`, every column a
+**mean over the designs** in that group. `terms_per_design.csv` has the same
+columns unaggregated, one row per design.
+
+There are no aggregation suffixes here: every summary column is a mean, so
+`_mean` everywhere would carry no information. The prefix convention matches
+validity — `term_` is the design (`NNNN_<pfx>.pdb`), `ref_term_` is the native
+CDR (`REF1_<pfx>.pdb`), and each control sits directly after the column it
+controls.
+
+### What a "term" is
+
+`ref2015` is not a single formula but a **weighted sum of about nineteen
+components**, each one a *score term*:
+
+```
+total_score = sum over terms of  weight[term] * value[term]
+```
+
+Lower is more favourable. The columns here are parts of one score, not
+alternative ways of scoring, and they add up to `total`.
+
+Terms come in two kinds, which is only a statement about how each is computed:
+
+- **one-body** — depends on a single residue's own conformation:
+  `fa_dun`, `rama_prepro`, `p_aa_pp`, `omega`, `ref`, `fa_intra_*`
+- **two-body** — depends on a pair of residues: `fa_atr`, `fa_rep`, `fa_sol`,
+  `fa_elec`, `lk_ball_wtd`, `hbond_*`
+
+`fa` stands for **full-atom**, as opposed to Rosetta's coarse-grained *centroid*
+mode where a side chain collapses to one pseudo-atom.
+
+### How each value is computed
+
+In `cdr_term_scores` (`diffab/tools/eval/rosetta_terms.py`):
+
+1. `pose_from_pdb` loads the complex, `scorefxn(pose)` scores it with `ref2015`.
+2. `pdb2pose` maps `residue_first`/`residue_last` to pose indices — the same CDR
+   slice the validity metrics use.
+3. Per term: `sum(residue_total_energies(i)[term] for i in CDR) * weight`.
+
+Three things follow.
+
+**Values are weighted**, so all columns are in comparable Rosetta Energy Units
+and sum to `total`. The weights are not all 1:
+
+```
+fa_atr 1.0   fa_sol 1.0   fa_elec 1.0   hbond_* 1.0   ref 1.0
+fa_rep 0.55  fa_dun 0.7   p_aa_pp 0.6   rama_prepro 0.45   omega 0.4
+```
+
+`fa_atr` and `fa_rep` are the attractive and repulsive halves of one
+Lennard-Jones potential, split so they can be weighted separately — Rosetta
+deliberately softens repulsion.
+
+**These are the CDR's share, not its total interaction energy.** A two-body
+energy is computed once for the pair and then attributed half to each partner,
+so a CDR-to-antigen contact contributes half here and half to the antigen
+residue outside the slice. (Verifiable: summing any term over *all* residues
+reproduces the whole-pose value exactly, which only works if the split is even.)
+
+**Sign convention:** negative is favourable, positive is a penalty.
+
+### Columns
+
+| Column | Meaning |
+| --- | --- |
+| `term_total_no_ref` | `total` minus the `ref` term. **The column to compare designs on** |
+| `term_total` | the CDR's share of the pose score, weighted sum over all terms |
+| `term_total_per_res` | `total / n_res`, comparable across CDRs of different length |
+| `term_rama_prepro` | Ramachandran, pre-proline aware — are phi/psi in a populated region. The most direct "is this backbone legal" signal here |
+| `term_fa_rep` | Lennard-Jones repulsion: steric strain. Soft and longer-range, so more sensitive than the hard 2.2 A cutoff behind `clash_n` |
+| `term_p_aa_pp` | `P(amino acid | phi, psi)` — is the designed residue type compatible with the backbone it was given. The one term that probes sequence/structure consistency directly |
+| `term_n_res` | residues in the slice; `ref_term_n_res` always equals it |
+
+Why `total_no_ref` rather than `total`: `ref` is a per-amino-acid constant
+depending only on composition, so a design that chose bulkier residues carries a
+different baseline for reasons with no structural content. Subtracting it removes
+that offset. In this dataset the difference is worth up to ~6.6 REU.
+
+### Reporting more terms
+
+Every term is computed on the same scoring pass, so the unreported ones cost
+nothing. `REPORT_ORDER` at the top of `rosetta_terms.py` controls what is
+written — add a name and re-run.
+
+Two are deliberately excluded and should not be added: **`hbond_sr_bb` and
+`hbond_lr_bb`**. Rosetta keeps those in separate whole-pose energy containers and
+never attributes them to individual residues, so a per-residue query returns
+`0.0` for any structure, loop or helix. They previously appeared as columns of
+zeros, which read like a finding about the loops and was not one.
+
+### `total` is not `dG`
+
+The most common confusion, since both are `ref2015` in REU:
+
+| | `term_total` | `dG_gen` (in `summary.csv`) |
+| --- | --- | --- |
+| Kind | one structure's score | a **difference** of two scores |
+| Definition | score of the complex, CDR residues only | `score(complex) - score(chains separated and repacked)` |
+| Answers | how strained is this loop | how much does binding gain |
+| Scope | the CDR slice | the whole antibody-antigen interface |
+
+`total_score` is like an altitude; `dG` is a height difference between two
+points. A design can be badly strained (poor `total`) yet still grip the antigen
+(acceptable `ddG`), or the reverse — neither is derivable from the other.
+
+### Caveats
+
+- **`total` excludes backbone hydrogen bonding.** It is built from
+  `residue_total_energy`, which omits the two undecomposable `hbond_*_bb` terms.
+  Design and native are both missing the same contribution, so comparisons hold,
+  but the absolute value is not a complete energy. Arithmetically:
+  `sum(residue_total_energy) - total_score = hbond_sr_bb + hbond_lr_bb`.
+- **`ref2015` has no bond-length or bond-angle term.** Every column here is blind
+  to the connectivity defects the validity metrics measure; a 0.38 A peptide bond
+  registers nowhere in this file. `omega` penalises a *twisted* peptide, not a
+  broken one. The two files measure genuinely different things.
+- **These are post-relax numbers.** FastRelax minimised exactly these terms, so
+  what remains is *residual* strain that survived local optimisation — a floor,
+  not the strain the model produced.
+- **`fa_dun` reflects relaxation, not generation** (if you re-enable it). DiffAb
+  emits no side chains; their rotamers were chosen by the relax stage.
+
 ## Thresholds and constants
 
 All at the top of `diffab/tools/eval/geometry.py`; change and re-run.
@@ -509,7 +636,9 @@ of residual strain.
 - **`validate` ignores `evaluation_db`; `run` does not.** If `run` reports no new
   tasks, its shelve database already lists those files as visited.
 
-## Appendix: `validity_summary.csv` column order
+## Appendix: summary column order
+
+### `validity_summary.csv`
 
 31 columns, in file order. Each `ref_*` control follows the column it controls.
 
@@ -536,6 +665,24 @@ The layout is defined by `SUMMARY_SPEC` at the top of
 `diffab/tools/eval/validate.py` as `(column, aggregations, reference column)`
 triples; edit that list to add, drop or reorder columns. `validity_per_design.csv`
 always carries the full 67 columns regardless.
+
+### `terms_summary.csv`
+
+17 columns. `terms_per_design.csv` carries the same set plus `filename`.
+
+| # | Column | | # | Column |
+| --- | --- | --- | --- | --- |
+| 1 | `method` | | 10 | `term_rama_prepro` |
+| 2 | `structure` | | 11 | `ref_term_rama_prepro` |
+| 3 | `cdr` | | 12 | `term_fa_rep` |
+| 4 | `term_total_no_ref` | | 13 | `ref_term_fa_rep` |
+| 5 | `ref_term_total_no_ref` | | 14 | `term_p_aa_pp` |
+| 6 | `term_total` | | 15 | `ref_term_p_aa_pp` |
+| 7 | `ref_term_total` | | 16 | `term_n_res` |
+| 8 | `term_total_per_res` | | 17 | `ref_term_n_res` |
+| 9 | `ref_term_total_per_res` | | | |
+
+Order comes from `REPORT_ORDER` in `rosetta_terms.py`.
 
 ## Why these metrics exist
 
