@@ -4,18 +4,31 @@ import ray
 import shelve
 import time
 import pandas as pd
+from functools import partial
 from typing import Mapping
 
-from tools.eval.base import EvalTask, TaskScanner
-from tools.eval.similarity import eval_similarity
-from tools.eval.energy import eval_interface_energy
+from diffab.tools.eval.base import EvalTask, TaskScanner
+from diffab.tools.eval.similarity import eval_similarity
+from diffab.tools.eval.geometry import (
+    eval_backbone_validity,
+    eval_prerelax_validity,
+    eval_relax_shift,
+)
 
 
 @ray.remote(num_cpus=1)
 def evaluate(task, args):
     funcs = []
     funcs.append(eval_similarity)
+    if not args.no_validity:
+        funcs.append(eval_backbone_validity)
+        funcs.append(partial(eval_prerelax_validity, postfix=args.pfx))
+        funcs.append(partial(eval_relax_shift, postfix=args.pfx))
     if not args.no_energy:
+        # Imported lazily: `energy` calls pyrosetta.init() at module scope, so a
+        # top-level import would make the whole package require PyRosetta even
+        # when energy evaluation is switched off.
+        from diffab.tools.eval.energy import eval_interface_energy
         funcs.append(eval_interface_energy)
     for f in funcs:
         task = f(task)
@@ -39,6 +52,7 @@ def main():
     parser.add_argument('--root', type=str, default='./results')
     parser.add_argument('--pfx', type=str, default='rosetta')
     parser.add_argument('--no_energy', action='store_true', default=False)
+    parser.add_argument('--no_validity', action='store_true', default=False)
     args = parser.parse_args()
     ray.init()
     

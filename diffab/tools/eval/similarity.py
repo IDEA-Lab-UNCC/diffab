@@ -1,6 +1,12 @@
 import numpy as np
 from Bio.PDB import PDBParser, Selection
-from Bio.PDB.Polypeptide import three_to_one
+try:
+    from Bio.PDB.Polypeptide import three_to_one
+except ImportError:     # Biopython >= 1.82 dropped the helper
+    from Bio.PDB.Polypeptide import protein_letters_3to1
+
+    def three_to_one(resname):
+        return protein_letters_3to1[resname]
 from Bio import pairwise2
 from Bio.Align import substitution_matrices
 
