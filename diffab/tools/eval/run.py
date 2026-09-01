@@ -6,9 +6,9 @@ import time
 import pandas as pd
 from typing import Mapping
 
-from tools.eval.base import EvalTask, TaskScanner
-from tools.eval.similarity import eval_similarity
-from tools.eval.energy import eval_interface_energy
+from diffab.tools.eval.base import EvalTask, TaskScanner
+from diffab.tools.eval.similarity import eval_similarity
+from diffab.tools.eval.energy import eval_interface_energy
 
 
 @ray.remote(num_cpus=1)

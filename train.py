@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+
 from diffab.datasets import get_dataset
 from diffab.models import get_model
 from diffab.utils.misc import *
@@ -68,6 +69,9 @@ if __name__ == '__main__':
     # Model
     logger.info('Building model...')
     model = get_model(config.model).to(args.device)
+    if torch.cuda.device_count() > 1:
+        logger.info('Using %d GPUs' % torch.cuda.device_count())
+        model = torch.nn.DataParallel(model)
     logger.info('Number of parameters: %d' % count_parameters(model))
 
     # Optimizer & scheduler
@@ -82,7 +86,7 @@ if __name__ == '__main__':
         logger.info('Resuming from checkpoint: %s' % ckpt_path)
         ckpt = torch.load(ckpt_path, map_location=args.device)
         it_first = ckpt['iteration']  # + 1
-        model.load_state_dict(ckpt['model'])
+        (model.module if isinstance(model, torch.nn.DataParallel) else model).load_state_dict(ckpt['model'])
         logger.info('Resuming optimizer states...')
         optimizer.load_state_dict(ckpt['optimizer'])
         logger.info('Resuming scheduler states...')
@@ -99,6 +103,7 @@ if __name__ == '__main__':
         # Forward
         # if args.debug: torch.set_anomaly_enabled(True)
         loss_dict = model(batch)
+        loss_dict = {k: v.mean() for k, v in loss_dict.items()}
         loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
         loss_dict['overall'] = loss
         time_forward_end = current_milli_time()
@@ -122,7 +127,7 @@ if __name__ == '__main__':
             logger.error('NaN or Inf detected.')
             torch.save({
                 'config': config,
-                'model': model.state_dict(),
+                'model': (model.module if isinstance(model, torch.nn.DataParallel) else model).state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'iteration': it,
@@ -140,6 +145,7 @@ if __name__ == '__main__':
                 batch = recursive_to(batch, args.device)
                 # Forward
                 loss_dict = model(batch)
+                loss_dict = {k: v.mean() for k, v in loss_dict.items()}
                 loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
                 loss_dict['overall'] = loss
 
@@ -154,6 +160,7 @@ if __name__ == '__main__':
         return avg_loss
 
     try:
+        time_train_start = current_milli_time()
         for it in range(it_first, config.train.max_iters + 1):
             train(it)
             if it % config.train.val_freq == 0:
@@ -162,11 +169,13 @@ if __name__ == '__main__':
                     ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
                     torch.save({
                         'config': config,
-                        'model': model.state_dict(),
+                        'model': (model.module if isinstance(model, torch.nn.DataParallel) else model).state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'iteration': it,
                         'avg_val_loss': avg_val_loss,
                     }, ckpt_path)
+        total_time = (current_milli_time() - time_train_start) / 1000
+        logger.info('Training finished in %.1f s (%.1f h)' % (total_time, total_time / 3600))
     except KeyboardInterrupt:
         logger.info('Terminating...')

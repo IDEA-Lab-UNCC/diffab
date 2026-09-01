@@ -11,7 +11,7 @@ pyrosetta.init(' '.join([
     '-no_fconfig',
 ]))
 
-from tools.eval.base import EvalTask
+from diffab.tools.eval.base import EvalTask
 
 
 def pyrosetta_interface_energy(pdb_path, interface):
