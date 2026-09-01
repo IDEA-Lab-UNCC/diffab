@@ -13,7 +13,7 @@ pyrosetta.init(' '.join([
     '-ignore_unrecognized_res',
     '-ignore_zero_occupancy', 'false',
     '-load_PDB_components', 'false',
-    '-relax:default_repeats', '2',
+    '-relax:default_repeats', '5',
     '-no_fconfig',
 ]))
 

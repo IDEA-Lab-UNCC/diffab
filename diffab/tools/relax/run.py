@@ -2,13 +2,15 @@ import argparse
 import ray
 import time
 
-from diffab.tools.relax.openmm_relaxer import run_openmm
 from diffab.tools.relax.pyrosetta_relaxer import run_pyrosetta, run_pyrosetta_fixbb
 from diffab.tools.relax.base import TaskScanner
 
 
 @ray.remote(num_gpus=1/8, num_cpus=1)
 def run_openmm_remote(task):
+    # Imported lazily: openmm_relaxer needs pdbfixer and openmm at module scope,
+    # which the pyrosetta-only pipelines do not require.
+    from diffab.tools.relax.openmm_relaxer import run_openmm
     return run_openmm(task)
 
 
