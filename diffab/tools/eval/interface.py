@@ -12,12 +12,22 @@ particular why the `CA-CA <= 6.0` convention in `utils/transforms/mask.py` is no
 the right one here -- it exists to pick a patch anchor, not to define an
 interface, and Cα positions ignore side-chain reach.
 
+The reference is read **unrelaxed** by default (`--ref-pfx ''`, i.e. `REF1.pdb`),
+independently of `--pfx`. Every CDR directory holds a byte-identical copy of the
+native, so this gives one unambiguous answer per structure. The relaxed
+`REF1_<pfx>.pdb` copies are *not* six replicates of one process: each had a
+single CDR made flexible, which also drags every downstream residue of that chain
+through the fold tree and repacks spatial neighbours, while leaving the rest
+untouched. Treating them as replicates measures the relax protocol, not the
+antibody.
+
     python -m diffab.tools.eval.interface --root ./results --reference-only
 """
 
 import os
 import copy
 import json
+import hashlib
 import argparse
 import numpy as np
 import pandas as pd
@@ -87,6 +97,11 @@ def residue_key(record):
 
 def interface_residues(records, cutoff=CONTACT_CUTOFF):
     return {residue_key(r) for r in records if r['min_dist'] <= cutoff}
+
+
+def file_digest(path):
+    with open(path, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
 
 
 def cdr_ranges(directory):
@@ -218,11 +233,11 @@ def reference_report(task, out_dir):
           f'{agree}/{len(ab_records)} ({100 * agree / len(ab_records):.0f}%)')
 
     table = pd.DataFrame(ab_records + ag_records)
-    table.insert(0, 'cdr', task.cdr)
+    table.insert(0, 'reference', os.path.relpath(task.ref_path, directory))
     table.insert(0, 'structure', task.structure)
     table.insert(0, 'method', task.method)
     table['contact'] = table['min_dist'] <= CONTACT_CUTOFF
-    return table[['method', 'structure', 'cdr', 'side', 'region', 'chain',
+    return table[['method', 'structure', 'reference', 'side', 'region', 'chain',
                   'resseq', 'icode', 'resname', 'min_dist', 'dsasa', 'contact']]
 
 
@@ -241,10 +256,12 @@ def _sort_key(label):
 def summarise(table):
     """One row per region: how many residues contact, and which.
 
-    Aggregated over every reference in `table`. Each CDR directory carries its
-    own relaxed reference, so a residue can contact in some references and not
-    others; `n_core` counts those present in all of them and the residue list
-    marks the rest with `*`.
+    Grouped by reference file. Contact sets from different references are never
+    merged: with `--ref-pfx rosetta` each reference had a different single CDR
+    relaxed -- which also drags downstream residues of that chain through the
+    fold tree and repacks spatial neighbours, while leaving the rest untouched --
+    so they are not replicates of one measurement and intersecting them would
+    mean nothing.
     """
     contacts = table[table['contact']].copy()
     if contacts.empty:
@@ -252,29 +269,24 @@ def summarise(table):
     contacts['residue'] = contacts.apply(_residue_label, axis=1)
 
     rows = []
-    for (method, structure, side, region), group in contacts.groupby(
-            ['method', 'structure', 'side', 'region'], sort=False):
-        n_refs = table[table['structure'] == structure]['cdr'].nunique()
-        seen = group.groupby('residue')['cdr'].nunique()
+    for (method, structure, reference, side, region), group in contacts.groupby(
+            ['method', 'structure', 'reference', 'side', 'region'], sort=False):
         names = group.drop_duplicates('residue').set_index('residue')['resname']
-        labels = []
-        for residue in sorted(seen.index, key=_sort_key):
-            mark = '' if seen[residue] == n_refs else '*'
-            labels.append(f'{residue}{mark} {names[residue]}')
+        labels = [f'{r} {names[r]}' for r in sorted(names.index, key=_sort_key)]
         rows.append({
             'method': method,
             'structure': structure,
+            'reference': reference,
             'side': side,
             'region': region,
             'n_contact': len(labels),
-            'n_core': int((seen == n_refs).sum()),
             'residues': '; '.join(labels),
         })
 
     summary = pd.DataFrame(rows)
     rank = {r: i for i, r in enumerate(REGION_ORDER)}
     summary['_o'] = summary['region'].map(lambda r: rank.get(r, len(rank)))
-    return summary.sort_values(['side', '_o', 'region']).drop(columns='_o')
+    return summary.sort_values(['reference', 'side', '_o', 'region']).drop(columns='_o')
 
 
 def print_summary(summary):
@@ -282,7 +294,7 @@ def print_summary(summary):
         part = summary[summary['side'] == side]
         if part.empty:
             continue
-        print(f'\n=== {side} contacts by region (* = not in every reference) ===')
+        print(f'\n=== {side} contacts by region ===')
         print(f"{'region':14}{'n':>4}  residues")
         for _, row in part.iterrows():
             print(f"{row['region']:14}{row['n_contact']:>4}  {row['residues']}")
@@ -295,6 +307,10 @@ def main():
     parser.add_argument('--pfx', type=str, default='rosetta')
     parser.add_argument('--out', type=str, default=None)
     parser.add_argument('--layout', choices=('flat', 'per_run', 'both'), default='per_run')
+    parser.add_argument('--ref-pfx', type=str, default='',
+                        help="postfix of the reference file to analyse; '' (default) "
+                             "reads the unrelaxed REF1.pdb, 'rosetta' reads "
+                             "REF1_rosetta.pdb")
     parser.add_argument('--reference-only', action='store_true', default=True,
                         help='analyse the reference structures (currently the only mode)')
     add_selection_args(parser)
@@ -304,18 +320,27 @@ def main():
     if not tasks:
         print(f'No structures matching *_{args.pfx}.pdb found under {args.root}.')
         return
+    # The reference file is chosen independently of the designs' postfix.
+    ref_name = f'REF1_{args.ref_pfx}.pdb' if args.ref_pfx else 'REF1.pdb'
+    for task in tasks:
+        task.ref_path = os.path.join(os.path.dirname(task.in_path), ref_name)
     selected = filter_tasks(tasks, args)
     if not selected:
         print(f'{len(tasks)} structures found, none matched the selection filters.')
         return
 
-    # One reference per (structure, CDR): every design in a CDR directory shares it.
+    # Dedupe by file content, not path: every CDR directory holds its own copy of
+    # the same native, so six paths collapse to one structure.
     seen, references = set(), []
     for task in selected:
-        if task.ref_path not in seen:
-            seen.add(task.ref_path)
+        if not os.path.exists(task.ref_path):
+            continue
+        key = (task.structure, file_digest(task.ref_path))
+        if key not in seen:
+            seen.add(key)
             references.append(task)
-    print(f'Found {len(tasks)} structures, {len(references)} distinct references.')
+    print(f'Found {len(tasks)} structures, '
+          f'{len(references)} distinct reference structure(s).')
 
     tables = []
     for task in references:
