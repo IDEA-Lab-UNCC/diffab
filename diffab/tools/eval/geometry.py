@@ -34,7 +34,7 @@ CLASH_SEVERE = 1.5      # A
 BACKBONE = ('N', 'CA', 'C', 'O')
 
 
-def _is_heavy(atom):
+def is_heavy(atom):
     element = (atom.element or '').strip().upper()
     if element:
         return element != 'H'
@@ -143,7 +143,7 @@ def backbone_clashes(model, reslist):
             order[(chain.id, res.id)] = idx
             idx += 1
 
-    heavy = [a for a in Selection.unfold_entities(model, 'A') if _is_heavy(a)]
+    heavy = [a for a in Selection.unfold_entities(model, 'A') if is_heavy(a)]
     if not heavy:
         return {}
     search = NeighborSearch(heavy)

@@ -14,6 +14,7 @@ reference-free metrics and how to run them.
 - [What is measured, and over which residues](#what-is-measured-and-over-which-residues)
 - [Column reference: validity](#column-reference-validity)
 - [Column reference: terms](#column-reference-terms)
+- [Interface contacts](#interface-contacts)
 - [Thresholds and constants](#thresholds-and-constants)
 - [Caveats](#caveats)
 - [Why these metrics exist](#why-these-metrics-exist)
@@ -31,6 +32,7 @@ generated structures.
 | `terms_per_design.csv` | `ref2015` term breakdown over the CDR, one row per design | `diffab.tools.eval.rosetta_terms` |
 | `terms_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.rosetta_terms` |
 | `peptide_bond_distribution.png` | bond-length histogram, one panel per CDR | `diffab.tools.eval.plot_geometry` |
+| `interface_reference.csv` | per-residue contact distances for the reference structures | `diffab.tools.eval.interface` |
 
 The files are not joined. They all key on `(method, structure, cdr)` plus
 `filename`, so they merge on those columns when needed.
@@ -150,7 +152,17 @@ sweep of the violation rate against the tolerance.
 python -m diffab.tools.eval.rosetta_terms --root ./results --pfx rosetta
 ```
 
-### 4. Full pipeline
+### 4. Interface contacts (no PyRosetta)
+
+```bash
+python -m diffab.tools.eval.interface --root ./results --pfx rosetta
+```
+
+Analyses the **reference** structures and writes `interface_reference.csv`.
+Accepts the same `--method` / `--structure` / `--cdr` filters and `--layout` as
+the other runners.
+
+### 5. Full pipeline
 
 ```bash
 python -m diffab.tools.eval.run --root ./results --pfx rosetta
@@ -573,6 +585,100 @@ points. A design can be badly strained (poor `total`) yet still grip the antigen
   not the strain the model produced.
 - **`fa_dun` reflects relaxation, not generation** (if you re-enable it). DiffAb
   emits no side chains; their rotamers were chosen by the relax stage.
+
+## Interface contacts
+
+`interface_reference.csv`, from `diffab/tools/eval/interface.py`. One row per
+residue of the complex — both the antibody and the antigen side.
+
+Chain assignment is **not hardcoded**: antibody chains come from the metadata
+(`task.ab_chains`), and every other chain in the model is treated as antigen,
+following the same convention as `energy.eval_interface_energy`.
+
+### The cutoff: 4.5 A minimum heavy-atom distance
+
+A contact is a pair of residues whose closest **heavy atoms** (hydrogens
+excluded) lie within 4.5 A. Measured on the 7DK2 reference — 226 antibody
+residues in chains A/B, 191 antigen residues in chain C:
+
+```
+  <= 4.0 A : 28 antibody / 26 antigen
+  <= 4.5 A : 31 antibody / 30 antigen     <- primary
+  <= 5.0 A : 37 antibody / 33 antigen
+  <= 6.0 A : 43 antibody / 44 antigen
+  closest contact: 2.66 A
+```
+
+Three reasons for 4.5:
+
+1. **It sits in the measured density trough.** Binning the antibody-side minimum
+   distances at 0.5 A gives 13 residues in 3.0–3.5, 10 in 3.5–4.0, then only
+   **3 in 4.0–4.5**, then 6 in 4.5–5.0. The distribution is otherwise continuous,
+   so this is its thinnest point, not a discovered boundary — the cutoff remains
+   a convention, just a well-placed one. `interface.py` prints the histogram on
+   every run so this stays auditable.
+2. **It cross-validates against a definition that uses no distance at all.**
+   Bio.PDB `ShrakeRupley` SASA burial (dSASA > 1 A^2, antibody alone minus
+   antibody in complex) flags 40 residues and agrees with the 4.5 A cutoff on
+   **217/226 residues (96%)**.
+3. It is the conventional antibody–antigen interface definition in the
+   literature.
+
+4.0, 5.0 and 6.0 are reported alongside as a sensitivity check.
+
+### Do not use `CA-CA <= 6.0`
+
+`diffab/utils/transforms/mask.py:194` defines `contact_flag = (nn_ab_dist <= 6.0)`
+on Cα–Cα distances. That threshold exists to sample a single **patch anchor** for
+cropping, not to define an interface, and it is the wrong tool here: on this
+structure it selects only **9** antibody residues against 31 at the 4.5 A
+heavy-atom cutoff. Cα positions ignore side-chain reach, and the contacts in this
+interface are overwhelmingly side-chain mediated — TYR, GLU, TRP, PHE and ARG
+dominate the list.
+
+### Columns
+
+| Column | Meaning |
+| --- | --- |
+| `method`, `structure`, `cdr` | which reference this row came from |
+| `side` | `antibody` or `antigen` |
+| `region` | CDR tag (`H_CDR3`, ...), `framework-<chain>`, or `antigen-<chain>` |
+| `chain`, `resseq`, `icode`, `resname` | residue identity; `icode` is the insertion code, blank for most |
+| `min_dist` | minimum heavy-atom distance to *any* residue on the opposite side, A |
+| `dsasa` | solvent-accessible surface area lost on binding, A^2 |
+| `contact` | `min_dist <= 4.5` |
+
+`min_dist` is `inf` for residues with no partner atom within 14 A
+(`SEARCH_RADIUS`). Constants are at the top of `interface.py`.
+
+### What the 7DK2 reference shows
+
+- **All six CDRs contact the antigen**, and H3 does not dominate: at 4.5 A,
+  H_CDR1 contributes 5 residues, H_CDR2 2, H_CDR3 6, L_CDR1 2, L_CDR2 5,
+  L_CDR3 4. L_CDR2 holds the single closest contact (B55 GLU, 2.66 A).
+- **The framework contributes 7 of 31 contacts**: A1, A33, A58, A94, B49, B57,
+  B60. Most are a CDR-definition artifact — DiffAb uses Chothia ranges, and A33
+  falls inside Kabat CDR-H1, A58 inside Kabat CDR-H2, A94 immediately abuts H3.
+  **A1 (GLU, 2.76 A) is not** — that is the chain N-terminus touching the
+  antigen, which is worth a look before trusting it.
+- The epitope is the ACE2-binding receptor-binding motif of the SARS-CoV-2 spike
+  RBD: K417, Y421, Y453, L455, F456, Y473, A475, G476, S477, E484, G485, F486,
+  N487, Y489, Q493, S494, G496, Q498, N501, G502, Y505 and neighbours. The
+  well-known variant positions (K417, E484, N501, Y505) are all in it.
+- **The epitope is stable across the six reference files.** Each CDR directory has
+  its own `REF1_<pfx>.pdb`, relaxed with a different CDR flexible. Of the 31
+  antigen residues in the union, **27 appear in all six**; only C403, C418, C473
+  and C484 move in or out. That variation is the relax stage repacking side
+  chains neighbouring the flexible CDR, and it sets the noise floor for any
+  future epitope-overlap metric.
+
+### Not yet implemented: per-design contacts
+
+This module currently analyses references only. The intended per-design metrics —
+contacts made by the designed CDR, overlap of its epitope with the native one,
+and closest approach to the antigen — are deferred. When they are added, the
+4-residue reference-to-reference variation above is the baseline they must be
+read against.
 
 ## Thresholds and constants
 
