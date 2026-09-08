@@ -5,6 +5,12 @@ and interface energy (`dG`, `ddG`). Neither says whether a generated CDR is a
 *chemically legal protein on its own terms*. This document covers the additional
 reference-free metrics and how to run them.
 
+It also documents `dG_int` / `dG_bind`, which replace `dG_gen`'s conflation of
+binding with packing strain — see
+[Column reference: binding](#column-reference-binding), and
+[`INTERFACE_ENERGY_ANALYSIS.md`](INTERFACE_ENERGY_ANALYSIS.md) for the full
+diagnosis and the corrected baseline-vs-fine-tuned comparison.
+
 ## Contents
 
 - [Output files](#output-files)
@@ -14,6 +20,7 @@ reference-free metrics and how to run them.
 - [What is measured, and over which residues](#what-is-measured-and-over-which-residues)
 - [Column reference: validity](#column-reference-validity)
 - [Column reference: terms](#column-reference-terms)
+- [Column reference: binding](#column-reference-binding)
 - [Interface contacts](#interface-contacts)
 - [Thresholds and constants](#thresholds-and-constants)
 - [Caveats](#caveats)
@@ -31,7 +38,10 @@ generated structures.
 | `validity_summary.csv` | 31 columns; one row per `(method, structure, cdr)` | `diffab.tools.eval.validate` |
 | `terms_per_design.csv` | `ref2015` term breakdown over the CDR, one row per design | `diffab.tools.eval.rosetta_terms` |
 | `terms_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.rosetta_terms` |
+| `binding_per_design.csv` | `dG_int`, `dG_bind`, `fa_rep_bound` + `ref_`/delta; one row per design | `diffab.tools.eval.binding` |
+| `binding_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.binding` |
 | `peptide_bond_distribution.png` | bond-length histogram, one panel per CDR | `diffab.tools.eval.plot_geometry` |
+| `dG_distribution.png`, `dG_violin.png` | interface energy per CDR (`--metric` picks which) | `diffab.tools.eval.plot_energy` |
 | `interface_reference.csv` | per-residue contact distances for the reference structures | `diffab.tools.eval.interface` |
 
 The files are not joined. They all key on `(method, structure, cdr)` plus
@@ -162,7 +172,46 @@ Analyses the **reference** structures and writes `interface_reference.csv`.
 Accepts the same `--method` / `--structure` / `--cdr` filters and `--layout` as
 the other runners.
 
-### 5. Full pipeline
+### 5. Binding energy without the strain artefact (needs PyRosetta)
+
+```bash
+python -m diffab.tools.eval.binding --root ./results --pfx rosetta --workers 12
+```
+
+Writes `binding_per_design.csv` and `binding_summary.csv`. See
+[Column reference: binding](#column-reference-binding) for why these exist
+alongside `dG_gen` — in short, `dG_gen` is dominated by packing strain rather
+than by binding.
+
+Costs ~4.0 s per design, so ~9 min per 600 designs on 12 cores. `--workers 1`
+runs serially without Ray. Accepts the usual `--method` / `--structure` / `--cdr`
+filters and `--layout`.
+
+### 6. Energy distribution plots
+
+```bash
+# one figure per run, from summary.csv
+python -m diffab.tools.eval.plot_energy --root ./results
+
+# overlay two runs, violins on one shared axis, using dG_bind
+python -m diffab.tools.eval.plot_energy \
+  --runs <runA> <runB> --labels baseline fine-tuned --out <runB> \
+  --kind violin --metric dG_bind --clip 100
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--metric` | `dG_separated` (default, reads `summary.csv`), `dG_bind`, `dG_int` |
+| `--kind` | `hist` (default, one panel per CDR) or `violin` (all CDRs, one shared axis) |
+| `--runs` / `--labels` | overlay several runs in a single figure |
+| `--clip` | hide the design tail above this percentile when drawing (default 99; 100 = no clipping) |
+| `--ylim LO HI` | explicit energy-axis limits for `--kind violin` |
+
+Output filenames derive from the metric (`dG_*`, `dG_bind_*`, `dG_int_*`), so
+metrics never overwrite each other. Runs are never pooled — each design
+distribution keeps its own reference, colour-matched.
+
+### 7. Full pipeline
 
 ```bash
 python -m diffab.tools.eval.run --root ./results --pfx rosetta
@@ -569,6 +618,12 @@ The most common confusion, since both are `ref2015` in REU:
 points. A design can be badly strained (poor `total`) yet still grip the antigen
 (acceptable `ddG`), or the reverse — neither is derivable from the other.
 
+One important qualification to the "Definition" row: only the *separated* side is
+repacked, so `dG_gen` is not a clean height difference — it also carries the
+structure's repackable strain. That makes the independence claim above weaker
+than it looks, since `dG` partly measures strain too. See
+[Column reference: binding](#column-reference-binding).
+
 ### Caveats
 
 - **`total` excludes backbone hydrogen bonding.** It is built from
@@ -585,6 +640,126 @@ points. A design can be badly strained (poor `total`) yet still grip the antigen
   not the strain the model produced.
 - **`fa_dun` reflects relaxation, not generation** (if you re-enable it). DiffAb
   emits no side chains; their rotamers were chosen by the relax stage.
+
+## Column reference: binding
+
+`binding_per_design.csv` and `binding_summary.csv`, from
+`diffab/tools/eval/binding.py`.
+
+### Why these exist: `dG_gen` is not a binding energy
+
+`InterfaceAnalyzerMover` computes `E(bound) - E(unbound)`, and each side can
+optionally be repacked first. `energy.py:33` enables `set_pack_separated(True)`
+and leaves `pack_input` at its `False` default, so the **unbound** state is
+allowed to relieve its side-chain strain and the **bound** state is not. The
+reported quantity is therefore
+
+```
+dG_gen  =  interaction energy  +  R
+```
+
+where `R >= 0` is whatever strain repacking can remove. Because DiffAb relaxes
+only a ~10 A shell around one CDR (`subset='nbrs'`), the other ~250 residues keep
+raw input side chains whose strain never cancels. Measured on the 7DK2 tree:
+
+| | range across the 6 CDR references |
+| --- | --- |
+| `dG_gen`-style value | 37.7 … 104.3 (spread **66.6** REU) |
+| interaction energy | −33.3 … −44.9 (spread **11.5** REU) |
+| `R` | 79.3 … 138.1 (spread **58.8** REU) |
+
+`corr(dG_ref, R) = +0.985` versus `corr(dG_ref, interaction) = +0.488`. So the
+column is closer to a *strain meter* than to an affinity. Full derivation, the
+2x2 flag table, and the term-by-term cancellation proof are in
+[`INTERFACE_ENERGY_ANALYSIS.md`](INTERFACE_ENERGY_ANALYSIS.md).
+
+### Columns
+
+Each appears three times: bare (the design), `ref_`-prefixed (the native
+control), and as a delta. Lower is better for all three.
+
+| Column | Meaning |
+| --- | --- |
+| `dG_int` | `dG_separated` with **packing off on both sides** |
+| `ref_dG_int` | the same for the native; **one cached value per CDR** |
+| `ddG_int` | `dG_int - ref_dG_int` |
+| `dG_bind` | `dG_separated` with **packing on both sides** |
+| `ref_dG_bind` | the same for the native, averaged over `REF_REPEATS = 3` |
+| `ddG_bind` | `dG_bind - ref_dG_bind` |
+| `fa_rep_bound` | weighted `fa_rep` of the bound complex, no repacking |
+| `ref_fa_rep_bound` | the same for the native |
+| `delta_fa_rep_bound` | `fa_rep_bound - ref_fa_rep_bound` |
+
+### `dG_int` — interaction energy, exactly strain-free
+
+Packing off on both sides means the separated pose is a pure rigid-body
+translation of the bound one, so **every one-body and intra-chain term is bit
+identical and cancels to exactly zero** — verified: 11 of 19 `ref2015` terms,
+including all 972 REU of `fa_dun`. Only the eight genuine inter-chain terms
+survive (`fa_atr`, `fa_sol`, `fa_rep`, `fa_elec`, `lk_ball_wtd`, `hbond_bb_sc`,
+`hbond_lr_bb`, `hbond_sc`).
+
+Consequences:
+
+- **Deterministic.** No packer runs, so no RNG is consumed: repeated scorings of
+  the same file give `sd = 0.00`. Contrast `dG_ref`, which takes 6–16 distinct
+  values per 100 draws purely from the packer's seed.
+- **Immune to `R`.** The relaxation-quality artefact is gone by construction.
+- **Comparable across CDRs**, which `ddG` is not.
+
+It is an **interaction energy, not a free energy.** The unbound state stays
+frozen in its bound conformation, so it omits side-chain reorganisation, backbone
+relaxation, and conformational entropy on unbinding — all of which make it
+overstate affinity. It is also not fully relax-independent: the designed CDR's
+own side chains were built by relax and sit on the interface.
+
+### `dG_bind` — closer to a real ΔG
+
+Both states get the same side-chain optimisation, so strain cancels
+approximately rather than exactly, but the unbound state is now allowed the
+reorganisation that genuinely accompanies unbinding — which is the correct
+physics `pack_separated=True` was designed to capture.
+
+Stochastic, but far less so than `dG_gen`: `sd ~0.25` REU on relaxed structures,
+so one sample per design suffices. Costs ~2.4 s per structure against 1.7 s for
+`dG_int`.
+
+### `fa_rep_bound` — the strain your validity metrics cannot see
+
+`fa` = full-atom, `rep` = repulsive. Rosetta splits the Lennard-Jones 6–12
+potential into `fa_atr` (attractive r⁻⁶, ≤ 0, weight 1.00) and `fa_rep`
+(repulsive r⁻¹², ≥ 0, weight 0.55). It penalises every atom pair closer than the
+sum of their van der Waals radii, and is linearised at very short range rather
+than diverging — which is why a badly clashing structure scores 1100 instead of
+infinity.
+
+Not a binding term. It is recorded because it is what actually drives the spread
+in `dG_gen` (Spearman **0.72** within H_CDR3, against 0.25 for the interaction
+energy), and because **`clash_n` is blind to it**: `clash_n` counts only
+backbone–backbone pairs under 2.2 A inside the CDR, while `fa_rep` is all-atom
+repulsion across all 311 residues — overwhelmingly side chains, which DiffAb
+never generated. Designs with `fa_rep_bound` of 489 and 915 both have
+`clash_n = 0`.
+
+Baseline is ~517–532 for five CDRs (the shared, never-relaxed bulk of the
+structure). H_CDR3 reaches a median of 612 and a max of 1100.
+
+### Caveats
+
+- **The reference is scored once per CDR, not per design.** This is deliberate —
+  it is what removes the seed noise — but it means `ref_*` columns are constant
+  within a CDR, and the reference spread that `plot_energy` draws for
+  `dG_separated` collapses to a single line.
+- **Different references per CDR remain.** `binding.py` reads the same
+  `REF1_rosetta.pdb` files, so the six CDRs still have six differently relaxed
+  natives. `dG_int` removes the *strain* consequence of that (spread falls from
+  66.6 to 11.5 REU) but not the underlying difference. A single `subset='all'`
+  relax of the native would.
+- **`dG_bind` does not rescue a clashed design.** For H_CDR3 its median is
+  +32.7 (baseline) and +6.9 (fine-tuned) against −19 to +3 for every other CDR;
+  repacking cannot fix strain that severe.
+- **`summary.csv` is untouched.** `dG_gen` / `dG_ref` / `ddG` keep their original
+  meaning and values; these are additional columns in a separate file.
 
 ## Interface contacts
 
@@ -794,6 +969,20 @@ of residual strain.
   though the tails do reach impossible values (0.38 Å, 3.82 Å).
 - **`validate` ignores `evaluation_db`; `run` does not.** If `run` reports no new
   tasks, its shelve database already lists those files as visited.
+- **`dG_ref` in `summary.csv` is not a constant.** Two independent causes. (a)
+  `energy.py` scores `REF1_rosetta.pdb`, and the six CDRs have six differently
+  relaxed natives — a 66.6 REU spread, so **`ddG` is not comparable across
+  CDRs**. (b) `set_pack_separated(True)` repacks stochastically from the process
+  RNG, giving 6–16 distinct values per 100 draws (`sd` 0.5–2.3 REU); `dG_ref` is
+  recomputed for every design rather than once per CDR, which is what turns a
+  fixed reference into 1200 noisy draws. `-constant_seed` reproduces a run
+  exactly. `dG_int` in `binding_per_design.csv` has neither problem.
+- **IMP% (`ddG < 0`) is fragile near zero.** For L_CDR3 a 2 REU shift in the
+  threshold moves IMP% by 20 points, because designs pile up right where the
+  reference sits — and the two 7DK2 runs' L_CDR3 references differ by 3.52 REU,
+  six times the within-run `sd`. Scoring both runs against a common per-CDR
+  threshold moved the pooled comparison from +6.8 to −1.7. Prefer a margin
+  (`ddG < -5`) or `ddG_int`.
 
 ## Appendix: summary column order
 
@@ -843,6 +1032,21 @@ always carries the full 67 columns regardless.
 
 Order comes from `REPORT_ORDER` in `rosetta_terms.py`.
 
+### `binding_summary.csv`
+
+12 columns. `binding_per_design.csv` carries the same set plus `filename`.
+
+| # | Column | | # | Column |
+| --- | --- | --- | --- | --- |
+| 1 | `method` | | 7 | `dG_bind` |
+| 2 | `structure` | | 8 | `ref_dG_bind` |
+| 3 | `cdr` | | 9 | `ddG_bind` |
+| 4 | `dG_int` | | 10 | `fa_rep_bound` |
+| 5 | `ref_dG_int` | | 11 | `ref_fa_rep_bound` |
+| 6 | `ddG_int` | | 12 | `delta_fa_rep_bound` |
+
+Order comes from `REPORT_ORDER` and `DELTA_NAMES` in `binding.py`.
+
 ## Why these metrics exist
 
 `rmsd` and `seqid` measure similarity to the reference. `dG`/`ddG` measure the
@@ -858,3 +1062,10 @@ possible:
 The metrics here close that gap. `ref_*` controls are computed throughout, on the
 native structure through the same protocol, so every number can be read against
 the value a real antibody scores.
+
+`dG` turned out to have a second, separate problem: it charges the whole
+structure's side-chain packing strain to the binding term, so it measures
+relaxation quality as much as affinity, and `ddG` cannot be compared across CDRs.
+`dG_int` and `dG_bind` measure binding without that confound, and
+`fa_rep_bound` measures the all-atom packing strain the backbone-only validity
+metrics cannot see. The three together separate what `dG_gen` had merged.
