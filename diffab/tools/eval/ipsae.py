@@ -335,7 +335,8 @@ def config_tag(opts):
     made no difference.
     """
     payload = '|'.join(str(opts.get(k)) for k in
-                       ('checkpoint', 'num_loops', 'num_sampling_steps', 'dtype'))
+                       ('checkpoint', 'num_loops', 'num_sampling_steps', 'dtype',
+                        'num_diffusion_samples'))
     return hashlib.sha1(payload.encode()).hexdigest()[:6]
 
 
@@ -364,6 +365,7 @@ def _fold_one(job, opts):
             checkpoint=opts['checkpoint'], device=opts['device'],
             num_loops=opts['num_loops'], num_sampling_steps=opts['num_sampling_steps'],
             dtype=opts.get('dtype'),
+            num_diffusion_samples=opts.get('num_diffusion_samples', 1),
         )
         with engine:
             task = FoldTask(name=job['name'], chains=job['chains'],
@@ -594,6 +596,9 @@ def main():
                              'fp32 footprint of the ESMC stem')
     parser.add_argument('--num-loops', type=int, default=None)
     parser.add_argument('--num-sampling-steps', type=int, default=None)
+    parser.add_argument('--num-diffusion-samples', type=int, default=1,
+                        help='diffusion samples per complex; the best by ipTM '
+                             'is kept. Costs GPU time linearly')
     parser.add_argument('--probe', action='store_true',
                         help='fold a toy dimer and print the ESMFold2 result fields')
     add_selection_args(parser)
@@ -616,6 +621,7 @@ def main():
         'dtype': args.dtype,
         'num_loops': args.num_loops or esmfold2.DEFAULT_NUM_LOOPS,
         'num_sampling_steps': args.num_sampling_steps or esmfold2.DEFAULT_SAMPLING_STEPS,
+        'num_diffusion_samples': args.num_diffusion_samples,
         'pae_cutoff': args.pae_cutoff,
         'dist_cutoff': args.dist_cutoff,
     }
@@ -635,7 +641,19 @@ def main():
         print(f'{len(tasks)} structures found, none matched the selection filters.')
         return
 
-    tasks = select_top(selected, args.top_n, args.rank_by)
+    if {'designs', 'negative'} & set(arms):
+        tasks = select_top(selected, args.top_n, args.rank_by)
+    else:
+        # A native-only sweep has nothing to rank: the native is one fold per
+        # run regardless of which design is picked. Requiring
+        # binding_per_design.csv here would block exactly the runs a control
+        # sweep is for -- the ones not yet scored with PyRosetta.
+        seen, tasks = set(), []
+        for task in selected:
+            if run_dir(task) not in seen:
+                seen.add(run_dir(task))
+                tasks.append(task)
+        print(f'[INFO] native-only: {len(tasks)} run(s), no ranking needed.')
     if not tasks:
         print('Nothing to score.')
         return

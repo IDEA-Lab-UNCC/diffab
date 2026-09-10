@@ -165,19 +165,38 @@ def _fetch(result, names, what, required=True):
     )
 
 
-def _drop_sample_axis(array, ndim_wanted):
-    """Strip the leading diffusion-sample axis, if the array carries one.
+def _drop_sample_axis(array, ndim_wanted, index=0):
+    """Strip the leading diffusion-sample axis, keeping sample `index`.
 
-    The hosted API returns PAE as `(diffusion_samples, N, N)` and pLDDT as
-    `(diffusion_samples, N)`. We always request one sample, so take the first.
+    Arrays come back as `(diffusion_samples, ...)` when more than one sample is
+    requested; with one sample the axis may be absent entirely, so this is a
+    no-op in the common case.
     """
     array = _as_array(array)
     while array.ndim > ndim_wanted:
-        if array.shape[0] != 1:
-            print(f'[WARNING] {array.shape[0]} diffusion samples returned; using the first.',
-                  flush=True)
-        array = array[0]
+        array = array[index if array.shape[0] > index else 0]
     return array
+
+
+def _best_sample(result):
+    """Index of the highest-ipTM diffusion sample, or 0 when there is one.
+
+    Diffusion predictors are normally run with several samples and the best
+    kept -- taking sample 0 would throw away most of what extra samples buy.
+    ipTM is the selection criterion because the interface is what this pipeline
+    measures; pTM would favour a well-folded but undocked complex.
+    """
+    raw = _fetch(result, _IPTM_ATTRS, 'ipTM', required=False)
+    if raw is None:
+        return 0
+    values = _as_array(raw).reshape(-1)
+    if values.size <= 1:
+        return 0
+    best = int(np.argmax(values))
+    print(f'[INFO] {values.size} diffusion samples, ipTM '
+          f'{np.min(values):.3f}-{np.max(values):.3f}; keeping sample {best}.',
+          flush=True)
+    return best
 
 
 def extract_confidence(result):
@@ -188,8 +207,9 @@ def extract_confidence(result):
     AF2 path can only take a single scalar ipTM, so this is carried separately
     -- for an Fv plus antigen the per-pair value is the informative one.
     """
-    pae = _drop_sample_axis(_fetch(result, _PAE_ATTRS, 'the PAE matrix'), 2)
-    plddt = _drop_sample_axis(_fetch(result, _PLDDT_ATTRS, 'pLDDT'), 1)
+    best = _best_sample(result)
+    pae = _drop_sample_axis(_fetch(result, _PAE_ATTRS, 'the PAE matrix'), 2, best)
+    plddt = _drop_sample_axis(_fetch(result, _PLDDT_ATTRS, 'pLDDT'), 1, best)
 
     # pLDDT is reported on 0-1 by some builds and 0-100 by others; ipsae's
     # pDockQ terms assume 0-100.
@@ -198,10 +218,14 @@ def extract_confidence(result):
 
     ptm = _fetch(result, _PTM_ATTRS, 'pTM', required=False)
     iptm = _fetch(result, _IPTM_ATTRS, 'ipTM', required=False)
-    to_float = lambda v: -1.0 if v is None else float(_as_array(v).reshape(-1)[0])
+    def to_float(v):
+        if v is None:
+            return -1.0
+        flat = _as_array(v).reshape(-1)
+        return float(flat[best] if flat.size > best else flat[0])
 
     pair = _fetch(result, _PAIR_IPTM_ATTRS, 'per-pair ipTM', required=False)
-    pair_iptm = None if pair is None else _drop_sample_axis(pair, 2)
+    pair_iptm = None if pair is None else _drop_sample_axis(pair, 2, best)
     return pae, plddt, to_float(ptm), to_float(iptm), pair_iptm
 
 
@@ -260,12 +284,13 @@ class ESMFold2Engine(FoldingEngine):
 
     def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda',
                  num_loops=DEFAULT_NUM_LOOPS, num_sampling_steps=DEFAULT_SAMPLING_STEPS,
-                 dtype=None, keep_cif=True):
+                 dtype=None, num_diffusion_samples=1, keep_cif=True):
         self.checkpoint = checkpoint
         self.device = device
         self.dtype = dtype
         self.num_loops = num_loops
         self.num_sampling_steps = num_sampling_steps
+        self.num_diffusion_samples = num_diffusion_samples
         self.keep_cif = keep_cif
 
     def __enter__(self):
@@ -287,7 +312,7 @@ class ESMFold2Engine(FoldingEngine):
             model, spi,
             num_loops=self.num_loops,
             num_sampling_steps=self.num_sampling_steps,
-            num_diffusion_samples=1,
+            num_diffusion_samples=self.num_diffusion_samples,
             seed=task.seed,
         )
 
