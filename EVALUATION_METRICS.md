@@ -21,6 +21,7 @@ diagnosis and the corrected baseline-vs-fine-tuned comparison.
 - [Column reference: validity](#column-reference-validity)
 - [Column reference: terms](#column-reference-terms)
 - [Column reference: binding](#column-reference-binding)
+- [Column reference: ipSAE](#column-reference-ipsae)
 - [Interface contacts](#interface-contacts)
 - [Thresholds and constants](#thresholds-and-constants)
 - [Caveats](#caveats)
@@ -43,6 +44,9 @@ generated structures.
 | `peptide_bond_distribution.png` | bond-length histogram, one panel per CDR | `diffab.tools.eval.plot_geometry` |
 | `dG_distribution.png`, `dG_violin.png` | interface energy per CDR (`--metric` picks which) | `diffab.tools.eval.plot_energy` |
 | `interface_reference.csv` | per-residue contact distances for the reference structures | `diffab.tools.eval.interface` |
+| `ipsae_per_design.csv` | `ipsae_max`, `pdockq`, `iptm`, `sc_rmsd` + `ref_`/`neg_`; one row per design | `diffab.tools.eval.ipsae` |
+| `ipsae_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.ipsae` |
+| `esmfold2/` | cached ESMFold2 predictions (`.pdb`, `.json`, `.cif`) and ipsae's per-residue reports | `diffab.tools.eval.ipsae` |
 
 The files are not joined. They all key on `(method, structure, cdr)` plus
 `filename`, so they merge on those columns when needed.
@@ -211,7 +215,42 @@ Output filenames derive from the metric (`dG_*`, `dG_bind_*`, `dG_int_*`), so
 metrics never overwrite each other. Runs are never pooled — each design
 distribution keeps its own reference, colour-matched.
 
-### 7. Full pipeline
+### 7. ipSAE self-consistency (needs a GPU)
+
+```bash
+# once per machine: downloads weights and confirms the ESMFold2 result fields
+python -m diffab.tools.eval.ipsae --probe
+
+python -m diffab.tools.eval.ipsae --root ./results --top-n 5 --workers 2
+```
+
+Refolds the designed **sequences** with ESMFold2 and scores the antibody-antigen
+interface of the prediction with ipSAE. This is the only metric here that does
+not read DiffAb's coordinates; see
+[Column reference: ipSAE](#column-reference-ipsae) for what that buys.
+
+Needs `binding_per_design.csv` from section 5 first: designs are ranked by
+`ddG_int` and only the best `--top-n` per CDR are folded. A run without that
+file is skipped with a warning rather than folding an arbitrary subset. Folding
+is minutes per complex, so scoring all 600 designs of a run is not practical --
+600 designs x 3 arms would be days.
+
+| Flag | Effect |
+| --- | --- |
+| `--probe` | fold a toy dimer, print the result object's fields, and exit |
+| `--top-n <n>` | designs per CDR to fold, best first (default 5) |
+| `--rank-by <col>` | column of `binding_per_design.csv` to rank by (default `ddG_int`, ascending) |
+| `--arms <list>` | subset of `designs,native,negative` |
+| `--negative {shuffle,mismatch}` | shuffle the CDR in place, or swap in another target's antigen |
+| `--pae-cutoff`, `--dist-cutoff` | ipSAE cutoffs in A (default 10, 10); recorded in the CSV |
+| `--checkpoint <name>` | default `biohub/ESMFold2-Fast`; `biohub/ESMFold2` is the MSA-capable model |
+| `--workers <n>` | one GPU per worker (2 on this workstation); 1 runs serially without Ray |
+
+Predictions are cached in `<run>/evaluation/esmfold2/` keyed by a hash of the
+sequences folded, so an interrupted run resumes without refolding. Accepts the
+usual `--method` / `--structure` / `--cdr` filters and `--layout`.
+
+### 8. Full pipeline
 
 ```bash
 python -m diffab.tools.eval.run --root ./results --pfx rosetta
@@ -761,6 +800,110 @@ structure). H_CDR3 reaches a median of 612 and a max of 1100.
 - **`summary.csv` is untouched.** `dG_gen` / `dG_ref` / `ddG` keep their original
   meaning and values; these are additional columns in a separate file.
 
+## Column reference: ipSAE
+
+`ipsae_per_design.csv`, `ipsae_summary.csv`. Produced by
+`python -m diffab.tools.eval.ipsae`.
+
+### Why this exists
+
+Every other metric in this document reads the coordinates DiffAb produced.
+`rmsd` compares them to the native, `dG_int` scores their interface, `n_contact`
+counts their contacts. All of them take the pose as given, so none can
+distinguish a design that would actually fold and bind from one that merely
+scores well under the generator's own assumptions.
+
+This metric asks the orthogonal question: **hand only the designed sequence to
+an independent structure predictor -- does it rebuild the complex, confidently?**
+That is the self-consistency test binder-design papers use to filter designs
+before synthesis, and it is the one number here that DiffAb cannot influence
+except through the sequence it wrote.
+
+ipSAE rather than ipTM because ipTM averages over whole chains. An Fv plus
+antigen is mostly non-interface residues, so a genuinely confident epitope
+contact is diluted by several hundred residues that were never going to touch
+anything. ipSAE restricts the sum to residue pairs under a PAE cutoff and
+rescales `d0` to match, which is exactly the correction this geometry needs.
+
+ESMFold2 (CZI Biohub, May 2026) is the backend because it is reported to beat
+AlphaFold3 on antibody-antigen binding-pose accuracy -- the hardest complex
+class and the only one that matters here -- and because it is MIT-licensed,
+pip-installable, and takes multi-chain input directly.
+
+### The three arms
+
+An ipSAE value on its own means nothing, so three complexes are folded per
+design and reported side by side under the usual prefix grammar:
+
+| Prefix | Arm | What is folded |
+| --- | --- | --- |
+| *(none)* | design | the designed H + L + antigen sequences |
+| `ref_` | native | the crystal antibody, same antigen -- the ceiling |
+| `neg_` | negative | the designed chains with the CDR residues shuffled in place, same antigen -- the floor |
+
+The shuffle preserves length and amino-acid composition and touches only the
+residues DiffAb designed, so the negative differs from the design in exactly the
+variable under test. `--negative mismatch` instead pairs the antibody with a
+different structure's antigen, which is a harder floor.
+
+**Read the controls before reading the designs.** The runner prints the three
+means and warns when `ref_` and `neg_` differ by less than 0.1. If they do not
+separate, ipSAE is blind on that target and no difference between design methods
+can be read from it -- that is a result about the metric, not about the designs.
+
+### Columns
+
+| Column | Meaning |
+| --- | --- |
+| `ipsae_max` | the headline: best ipSAE between either antibody chain and the antigen |
+| `ipsae_H_Ag` | ipSAE between the heavy chain and the antigen |
+| `ipsae_L_Ag` | ipSAE between the light chain and the antigen |
+| `pdockq` | pDockQ for the same interface, as a cross-check |
+| `iptm`, `ptm` | ESMFold2's own whole-complex confidences |
+| `sc_rmsd` | CA-RMSD, CDR only, between ESMFold2's prediction and DiffAb's design |
+| `pae_cutoff`, `dist_cutoff` | the ipSAE cutoffs these rows were computed at |
+
+Each of the first six appears three times (`x`, `ref_x`, `neg_x`). `sc_rmsd` is
+design-only -- there is no native or negative counterpart to compare against.
+
+ipSAE is asymmetric; the value taken is ipsae.py's `max` row, which is the
+maximum over both directions and the value the paper reports. Where an antigen
+has several chains the best-scoring one wins, since a design only has to bind
+somewhere on the target.
+
+### `sc_rmsd` is the other half of self-consistency
+
+ESMFold2 folds from sequence, so it discards DiffAb's backbone entirely. That
+means ipSAE grades the designed **sequence**, not the designed **structure** --
+a design whose sequence folds into a good binder with a completely different CDR
+conformation still scores well. `sc_rmsd` closes that gap: the prediction is
+superposed on the antibody framework (every antibody CA except the CDR under
+test) and the CDR CA-RMSD is measured. Low ipSAE with low `sc_rmsd` means the
+conformation was reproduced but the interface was not; high `sc_rmsd` means the
+predictor disagrees with DiffAb about the CDR entirely.
+
+### Caveats
+
+- **Training-set contamination.** ESMFold2's data cutoff is September 2021, which
+  covers 7DK2 and most of the SAbDab test set. The `ref_` arm is therefore partly
+  memorised and is an optimistic ceiling, not a neutral reference. Design-versus-
+  negative separation is the defensible comparison.
+- **Only the best few designs are scored.** `ipsae_summary.csv` averages over
+  `--top-n` per CDR, not over all 600, so it is not comparable to
+  `binding_summary.csv`, which averages over everything. Compare like with like
+  by merging on `filename`.
+- **One diffusion sample per complex.** ESMFold2 is a diffusion model; a single
+  sample is taken for cost. Expect run-to-run variation, and re-fold with a
+  different `--negative-seed` if a number looks decisive.
+- **ipSAE cutoffs are a choice.** Upstream examples use 15 for AF2-style input
+  and 10 for AF3/Boltz. The default here is 10/10 and is recorded in every row,
+  so runs at different cutoffs stay distinguishable.
+- **`ipsae.py` mangles paths containing `.pdb`.** It derives its output filenames
+  with `pdb_path.replace(".pdb", "")`, a global replace, and every DiffAb run
+  directory is named `<target>.pdb_<timestamp>`. `run_ipsae` therefore scores a
+  copy in a scratch directory and copies the reports back; do not "simplify" it
+  to run in place.
+
 ## Interface contacts
 
 `interface_reference.csv` (one row per residue) and `interface_summary.csv` (one
@@ -1069,3 +1212,9 @@ relaxation quality as much as affinity, and `ddG` cannot be compared across CDRs
 `dG_int` and `dG_bind` measure binding without that confound, and
 `fa_rep_bound` measures the all-atom packing strain the backbone-only validity
 metrics cannot see. The three together separate what `dG_gen` had merged.
+
+All of that still reads coordinates DiffAb produced. `ipsae_max` and `sc_rmsd`
+are the one check that does not: they refold the designed sequence with an
+independent predictor and ask whether the complex comes back. A design can
+satisfy every metric above and still fail that, which is why the native and
+scrambled controls are folded alongside it rather than assumed.
