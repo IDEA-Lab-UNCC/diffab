@@ -132,3 +132,7 @@ dmypy.json
 /logs*
 /results*
 /*.csv
+
+# IDE / OS
+.idea/
+.DS_Store
