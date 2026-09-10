@@ -419,21 +419,30 @@ def select_top(tasks, top_n, rank_by):
                   f'Run `python -m diffab.tools.eval.binding --root <root>` first.')
             continue
         table = pd.read_csv(csv_path)
-        if rank_by not in table.columns:
-            print(f'[WARNING] {directory}: no column {rank_by!r} in '
+        columns = [c.strip() for c in rank_by.split(',') if c.strip()]
+        missing = [c for c in columns if c not in table.columns]
+        if missing:
+            print(f'[WARNING] {directory}: no column(s) {missing} in '
                   f'binding_per_design.csv, skipping.')
             continue
 
-        ranked = table.dropna(subset=[rank_by]).sort_values(rank_by)
         # Keyed by (cdr, filename), not filename alone: the same `0006_rosetta.pdb`
         # exists in all six CDR directories, so matching on the basename would
         # select every CDR's copy of each winner.
+        #
+        # Several columns take the *union* of each one's top-n. ddG_int and
+        # ddG_bind rank-correlate only ~0.6-0.7 and disagree sharply at the top,
+        # so `--rank-by ddG_int,ddG_bind` folds both shortlists and lets ipSAE
+        # arbitrate between them instead of inheriting one metric's blind spots.
         keep = set()
-        for cdr, cdr_rows in ranked.groupby('cdr'):
-            keep.update((cdr, f) for f in cdr_rows.head(top_n)['filename'])
+        for column in columns:
+            ranked = table.dropna(subset=[column]).sort_values(column)
+            for cdr, cdr_rows in ranked.groupby('cdr'):
+                keep.update((cdr, f) for f in cdr_rows.head(top_n)['filename'])
         chosen = [t for t in group if (t.cdr, os.path.basename(t.in_path)) in keep]
         print(f'[INFO] {os.path.basename(directory)}: {len(chosen)} of {len(group)} '
-              f'designs selected (top {top_n} per CDR by {rank_by})')
+              f'designs selected (top {top_n} per CDR by '
+              f'{" u ".join(columns)})')
         selected.extend(chosen)
     return selected
 
@@ -530,7 +539,9 @@ def main():
     parser.add_argument('--top-n', type=int, default=5,
                         help='designs per CDR to fold, best first')
     parser.add_argument('--rank-by', type=str, default='ddG_int',
-                        help='column of binding_per_design.csv to rank by, ascending')
+                        help='column(s) of binding_per_design.csv to rank by, '
+                             'ascending; comma-separated takes the union of '
+                             'each one\'s top-n')
     parser.add_argument('--arms', type=str, default='designs,native,negative',
                         help=f'comma-separated subset of {ARMS}')
     parser.add_argument('--negative', choices=('shuffle', 'mismatch'), default='shuffle',
