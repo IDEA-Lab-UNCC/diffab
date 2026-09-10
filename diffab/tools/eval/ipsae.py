@@ -78,7 +78,8 @@ PREFIX = {'designs': '', 'native': 'ref_', 'negative': 'neg_'}
 # Written per arm. `ipsae_max` is the headline: ipSAE is a per-ordered-pair
 # score, but the meaningful unit is Fv-versus-antigen, and the heavy chain
 # usually carries the interface.
-REPORT_ORDER = ('ipsae_max', 'ipsae_H_Ag', 'ipsae_L_Ag', 'pdockq', 'iptm', 'ptm')
+REPORT_ORDER = ('ipsae_max', 'ipsae_H_Ag', 'ipsae_L_Ag', 'pdockq',
+                'iptm_H_Ag', 'iptm_L_Ag', 'iptm', 'ptm')
 
 
 def _cutoff_string(value):
@@ -193,6 +194,31 @@ def run_ipsae(json_path, pdb_path, pae_cutoff, dist_cutoff):
     return table
 
 
+def pair_iptm_scores(pair_iptm, chain_order, roles, antigen_chains):
+    """Per-chain-pair ipTM for the Fv-versus-antigen pairs.
+
+    ESMFold2 reports a (n_chains, n_chains) ipTM matrix indexed in chain
+    submission order. ipsae.py's AF2 path can only carry one scalar ipTM for the
+    whole complex, so its `ipTM_af` column is the same number on every row --
+    useless for comparing H-vs-antigen against L-vs-antigen. This reads the
+    matrix directly, giving an independent per-interface confidence to set
+    beside ipSAE.
+    """
+    if pair_iptm is None:
+        return {}
+    matrix = np.asarray(pair_iptm)
+    index = {c: i for i, c in enumerate(chain_order)}
+    antigen = [c for c in antigen_chains if c in index]
+
+    def best(ab_chain):
+        if ab_chain is None or ab_chain not in index or not antigen:
+            return np.nan
+        i = index[ab_chain]
+        return float(max(matrix[i, index[a]] for a in antigen))
+
+    return {'iptm_H_Ag': best(roles.get('H')), 'iptm_L_Ag': best(roles.get('L'))}
+
+
 def aggregate_pairs(table, roles, antigen_chains):
     """Chain-pair rows -> the Fv-versus-antigen columns.
 
@@ -293,12 +319,15 @@ def _fold_one(job, opts):
             pae=np.array(payload['pae']), plddt=np.array(payload['plddt']),
             ptm=payload['ptm'], iptm=payload['iptm'],
             chain_order=list(job['chains'].keys()),
+            pair_iptm=(np.array(payload['pair_iptm'])
+                       if payload.get('pair_iptm') is not None else None),
         )
         check_af2_inputs(pdb_path, result)
     else:
         engine = ESMFold2Engine(
             checkpoint=opts['checkpoint'], device=opts['device'],
             num_loops=opts['num_loops'], num_sampling_steps=opts['num_sampling_steps'],
+            dtype=opts.get('dtype'),
         )
         with engine:
             task = FoldTask(name=job['name'], chains=job['chains'],
@@ -310,6 +339,8 @@ def _fold_one(job, opts):
     table = run_ipsae(json_path, result.pdb_path,
                       opts['pae_cutoff'], opts['dist_cutoff'])
     scores = aggregate_pairs(table, job['roles'], job['antigen'])
+    scores.update(pair_iptm_scores(result.pair_iptm, result.chain_order,
+                                   job['roles'], job['antigen']))
     scores['ptm'] = result.ptm
     scores['iptm'] = result.iptm
 
@@ -505,6 +536,9 @@ def main():
     parser.add_argument('--dist-cutoff', type=float, default=10.0)
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--dtype', choices=('bf16', 'fp16', 'fp32'), default=None,
+                        help='model precision; bf16 roughly halves the ~24 GB '
+                             'fp32 footprint of the ESMC stem')
     parser.add_argument('--num-loops', type=int, default=None)
     parser.add_argument('--num-sampling-steps', type=int, default=None)
     parser.add_argument('--probe', action='store_true',
@@ -514,7 +548,7 @@ def main():
 
     if args.probe:
         from diffab.tools.fold import esmfold2
-        esmfold2.probe(device=args.device,
+        esmfold2.probe(device=args.device, dtype=args.dtype,
                        checkpoint=args.checkpoint or esmfold2.DEFAULT_CHECKPOINT)
         return
 
@@ -526,6 +560,7 @@ def main():
     opts = {
         'checkpoint': args.checkpoint or esmfold2.DEFAULT_CHECKPOINT,
         'device': args.device,
+        'dtype': args.dtype,
         'num_loops': args.num_loops or esmfold2.DEFAULT_NUM_LOOPS,
         'num_sampling_steps': args.num_sampling_steps or esmfold2.DEFAULT_SAMPLING_STEPS,
         'pae_cutoff': args.pae_cutoff,

@@ -64,15 +64,26 @@ class FoldResult:
     iptm: float
     chain_order: List[str]
     residues: List[Tuple[str, int]] = field(default_factory=list)  # (chain, resseq)
+    # (n_chains, n_chains) per-chain-pair ipTM in chain_order, when the backend
+    # reports it. Not read by ipsae.py -- recorded alongside its output.
+    pair_iptm: Optional[np.ndarray] = None
 
     def json_payload(self):
-        """The AF2-style dict ipsae.py's `af2` branch reads."""
-        return {
+        """The cache record: ipsae.py's `af2` keys, plus what we add ourselves.
+
+        ipsae.py reads `pae`, `plddt`, `ptm` and `iptm` and ignores the rest, so
+        the extra key is free -- and it means a cached fold does not lose the
+        per-pair ipTM that only the live result object carries.
+        """
+        payload = {
             'pae': np.asarray(self.pae).tolist(),
             'plddt': np.asarray(self.plddt).tolist(),
             'ptm': float(self.ptm),
             'iptm': float(self.iptm),
         }
+        if self.pair_iptm is not None:
+            payload['pair_iptm'] = np.asarray(self.pair_iptm).tolist()
+        return payload
 
 
 class FoldingEngine(abc.ABC):

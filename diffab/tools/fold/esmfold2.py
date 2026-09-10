@@ -13,12 +13,11 @@ and the HuggingFace card disagree on capitalisation (`EsmFold2Model` vs
 `ESMFold2Model`), and this code is written on a machine that cannot install the
 package.
 
-`extract_confidence` does the same for the PAE accessor, which is the one part
-of the contract no reachable documentation pins down -- the hosted OpenProtein
-wrapper exposes `get_pae()` returning `(diffusion_samples, N, N)`, but the local
-package's name is unconfirmed. Run `--probe` on the workstation first; it prints
-the real attribute names and shapes, and this list should then be trimmed to
-the one that works.
+`extract_confidence` keeps a smaller candidate list for the same reason. The
+accessors were confirmed against esm 3.4.0 with `--probe` and the primary names
+are correct; the alternates remain only in case an upstream release renames one.
+`--probe` reprints the result object's fields on any machine, which is the way
+to re-check after an `esm` upgrade.
 
     python -m diffab.tools.eval.ipsae --probe
 """
@@ -41,11 +40,19 @@ DEFAULT_CHECKPOINT = 'biohub/ESMFold2-Fast'
 DEFAULT_NUM_LOOPS = 3
 DEFAULT_SAMPLING_STEPS = 50
 
-# Candidate accessors, most likely first. See the module docstring.
-_PAE_ATTRS = ('pae', 'get_pae', 'predicted_aligned_error', 'pde')
+# Confirmed against esm 3.4.0 / biohub/ESMFold2-Fast by `--probe`: the result
+# exposes `pae` (N, N), `plddt` (N,), scalar `ptm`/`iptm`, and `pair_chains_iptm`
+# (n_chains, n_chains) -- all direct attributes, no diffusion-sample axis. The
+# alternates are kept only as a cushion against an upstream rename.
+#
+# `pde` is deliberately NOT a PAE fallback. It is the predicted *distance* error,
+# a different quantity on a different scale; accepting it here would produce a
+# plausible-looking ipSAE computed from the wrong matrix.
+_PAE_ATTRS = ('pae', 'get_pae', 'predicted_aligned_error')
 _PLDDT_ATTRS = ('plddt', 'get_plddt')
 _PTM_ATTRS = ('ptm', 'get_ptm')
 _IPTM_ATTRS = ('iptm', 'get_iptm')
+_PAIR_IPTM_ATTRS = ('pair_chains_iptm', 'chain_pair_iptm')
 
 _MODEL = None
 _MODEL_KEY = None
@@ -84,20 +91,40 @@ def _esm_symbols():
     }
 
 
-def load_model(checkpoint=DEFAULT_CHECKPOINT, device='cuda'):
+def _torch_dtype(name):
+    if not name:
+        return None
+    import torch
+    try:
+        return {'bf16': torch.bfloat16, 'fp16': torch.float16,
+                'fp32': torch.float32}[name]
+    except KeyError:
+        raise ValueError(f'Unknown dtype {name!r}; use bf16, fp16 or fp32.')
+
+
+def load_model(checkpoint=DEFAULT_CHECKPOINT, device='cuda', dtype=None):
     """Load weights once per process.
 
     Memoised in a module global rather than passed around, so that each Ray
     worker pays the load cost once -- the same reason `eval/binding.py` caches
     its PyRosetta init.
+
+    `dtype` matters more here than the checkpoint name suggests. Even
+    `ESMFold2-Fast` pulls the ESMC 6B stem, which is ~24 GB in fp32 before any
+    activations. That fits a 48 GB card for a single Fv-plus-antigen complex,
+    but not with much room; `bf16` roughly halves it.
     """
     global _MODEL, _MODEL_KEY
-    key = (checkpoint, device)
+    key = (checkpoint, device, dtype)
     if _MODEL is None or _MODEL_KEY != key:
         sym = _esm_symbols()
-        print(f'[INFO] Loading {checkpoint} onto {device}', flush=True)
+        print(f'[INFO] Loading {checkpoint} onto {device}'
+              + (f' as {dtype}' if dtype else ''), flush=True)
+        kwargs = {'device': device}
+        if dtype:
+            kwargs['dtype'] = _torch_dtype(dtype)
         try:
-            model = sym['model'].from_pretrained(checkpoint, device=device)
+            model = sym['model'].from_pretrained(checkpoint, **kwargs)
         except TypeError:   # older signature: .from_pretrained(name).to(device)
             model = sym['model'].from_pretrained(checkpoint).to(device)
         _MODEL = model.eval()
@@ -147,7 +174,13 @@ def _drop_sample_axis(array, ndim_wanted):
 
 
 def extract_confidence(result):
-    """`(pae (N,N), plddt (N,), ptm, iptm)` from a prediction result."""
+    """`(pae (N,N), plddt (N,), ptm, iptm, pair_iptm)` from a prediction result.
+
+    `pair_iptm` is the (n_chains, n_chains) per-chain-pair ipTM, indexed in
+    chain-submission order, or None if the build does not report it. ipsae.py's
+    AF2 path can only take a single scalar ipTM, so this is carried separately
+    -- for an Fv plus antigen the per-pair value is the informative one.
+    """
     pae = _drop_sample_axis(_fetch(result, _PAE_ATTRS, 'the PAE matrix'), 2)
     plddt = _drop_sample_axis(_fetch(result, _PLDDT_ATTRS, 'pLDDT'), 1)
 
@@ -159,7 +192,10 @@ def extract_confidence(result):
     ptm = _fetch(result, _PTM_ATTRS, 'pTM', required=False)
     iptm = _fetch(result, _IPTM_ATTRS, 'ipTM', required=False)
     to_float = lambda v: -1.0 if v is None else float(_as_array(v).reshape(-1)[0])
-    return pae, plddt, to_float(ptm), to_float(iptm)
+
+    pair = _fetch(result, _PAIR_IPTM_ATTRS, 'per-pair ipTM', required=False)
+    pair_iptm = None if pair is None else _drop_sample_axis(pair, 2)
+    return pae, plddt, to_float(ptm), to_float(iptm), pair_iptm
 
 
 def _cif_text(result):
@@ -217,15 +253,16 @@ class ESMFold2Engine(FoldingEngine):
 
     def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda',
                  num_loops=DEFAULT_NUM_LOOPS, num_sampling_steps=DEFAULT_SAMPLING_STEPS,
-                 keep_cif=True):
+                 dtype=None, keep_cif=True):
         self.checkpoint = checkpoint
         self.device = device
+        self.dtype = dtype
         self.num_loops = num_loops
         self.num_sampling_steps = num_sampling_steps
         self.keep_cif = keep_cif
 
     def __enter__(self):
-        load_model(self.checkpoint, self.device)
+        load_model(self.checkpoint, self.device, self.dtype)
         return self
 
     def __exit__(self, typ, value, traceback):
@@ -233,7 +270,7 @@ class ESMFold2Engine(FoldingEngine):
 
     def fold(self, task: FoldTask) -> FoldResult:
         sym = _esm_symbols()
-        model = load_model(self.checkpoint, self.device)
+        model = load_model(self.checkpoint, self.device, self.dtype)
 
         chain_order = list(task.chains.keys())
         spi = sym['spi'](sequences=[
@@ -247,7 +284,7 @@ class ESMFold2Engine(FoldingEngine):
             seed=task.seed,
         )
 
-        pae, plddt, ptm, iptm = extract_confidence(result)
+        pae, plddt, ptm, iptm, pair_iptm = extract_confidence(result)
 
         os.makedirs(task.out_dir, exist_ok=True)
         stem = os.path.join(task.out_dir, task.name)
@@ -266,13 +303,13 @@ class ESMFold2Engine(FoldingEngine):
         folded = FoldResult(
             pdb_path=pdb_path, cif_path=cif_path,
             pae=pae, plddt=plddt, ptm=ptm, iptm=iptm,
-            chain_order=chain_order,
+            chain_order=chain_order, pair_iptm=pair_iptm,
         )
         check_af2_inputs(pdb_path, folded)
         return folded
 
 
-def probe(device='cuda', checkpoint=DEFAULT_CHECKPOINT):
+def probe(device='cuda', checkpoint=DEFAULT_CHECKPOINT, dtype=None):
     """Fold a two-chain toy peptide and report what the result object exposes.
 
     The point is to settle the accessor names on a machine that actually has the
@@ -282,7 +319,7 @@ def probe(device='cuda', checkpoint=DEFAULT_CHECKPOINT):
     print(f'[INFO] Resolved classes: '
           f"{ {k: v.__name__ for k, v in sym.items()} }", flush=True)
 
-    model = load_model(checkpoint, device)
+    model = load_model(checkpoint, device, dtype)
     spi = sym['spi'](sequences=[
         sym['protein'](id='A', sequence='GSHMKVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAK'),
         sym['protein'](id='B', sequence='MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIP'),
@@ -307,9 +344,10 @@ def probe(device='cuda', checkpoint=DEFAULT_CHECKPOINT):
               + (f' shape={tuple(shape)}' if shape is not None else ''))
 
     print('\n--- extract_confidence ---')
-    pae, plddt, ptm, iptm = extract_confidence(result)
+    pae, plddt, ptm, iptm, pair_iptm = extract_confidence(result)
     print(f'  pae   {pae.shape} range {pae.min():.2f}-{pae.max():.2f}')
     print(f'  plddt {plddt.shape} range {plddt.min():.2f}-{plddt.max():.2f}')
     print(f'  ptm={ptm:.4f}  iptm={iptm:.4f}')
+    print(f'  pair_iptm {None if pair_iptm is None else pair_iptm.shape}')
     print('\nExpected 74 residues (37 + 37).')
     return result
