@@ -33,12 +33,19 @@ from diffab.tools.fold.base import (
     FoldingEngine, FoldResult, FoldTask, check_af2_inputs,
 )
 
-DEFAULT_CHECKPOINT = 'biohub/ESMFold2-Fast'
+# The full model, not `-Fast`. The claim this project relies on -- that
+# ESMFold2 beats AlphaFold3 at antibody-antigen binding poses -- is made for
+# this checkpoint. Measured on 7DK2, `-Fast` at 3/50 folds both chains well
+# (pLDDT 87 / 83) and pairs H-L confidently (PAE 0.6) but never docks the
+# antigen: median interchain PAE 25 A against a ~31 A ceiling, identical for the
+# native complex and a scrambled negative. `-Fast` remains available via
+# --checkpoint when throughput matters more than the interface.
+DEFAULT_CHECKPOINT = 'biohub/ESMFold2'
 
-# Sampling defaults. The Fast checkpoint is single-sequence and inference
-# optimised; these follow the values in the upstream quickstart.
-DEFAULT_NUM_LOOPS = 3
-DEFAULT_SAMPLING_STEPS = 50
+# The upstream complex example's settings. The 3/50 in the Fast quickstart is
+# for single-chain inference and is too little sampling for a docked complex.
+DEFAULT_NUM_LOOPS = 20
+DEFAULT_SAMPLING_STEPS = 100
 
 # Confirmed against esm 3.4.0 / biohub/ESMFold2-Fast by `--probe`: the result
 # exposes `pae` (N, N), `plddt` (N,), scalar `ptm`/`iptm`, and `pair_chains_iptm`

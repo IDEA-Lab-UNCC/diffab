@@ -79,7 +79,7 @@ PREFIX = {'designs': '', 'native': 'ref_', 'negative': 'neg_'}
 # score, but the meaningful unit is Fv-versus-antigen, and the heavy chain
 # usually carries the interface.
 REPORT_ORDER = ('ipsae_max', 'ipsae_H_Ag', 'ipsae_L_Ag', 'pdockq',
-                'iptm_H_Ag', 'iptm_L_Ag', 'iptm', 'ptm')
+                'iptm_H_Ag', 'iptm_L_Ag', 'iptm', 'ptm', 'pae_min_AbAg')
 
 
 def _cutoff_string(value):
@@ -194,6 +194,28 @@ def run_ipsae(json_path, pdb_path, pae_cutoff, dist_cutoff):
     return table
 
 
+def interchain_pae_min(pae, chains, ab_chains, antigen_chains):
+    """Smallest antibody-to-antigen PAE in the prediction, in angstroms.
+
+    ipSAE collapses to exactly 0.0 whenever no residue pair clears the cutoff,
+    which makes "the interface is weak" and "the antigen was never docked"
+    indistinguishable in the output. This separates them: a value near the ~31 A
+    PAE ceiling means the predictor had no idea where the antigen goes, and no
+    choice of cutoff will help.
+    """
+    bounds, start = {}, 0
+    for cid, seq in chains.items():
+        bounds[cid] = (start, start + len(seq))
+        start += len(seq)
+    def idx(ids):
+        spans = [np.arange(*bounds[c]) for c in ids if c in bounds]
+        return np.concatenate(spans) if spans else np.array([], dtype=int)
+    ab, ag = idx(ab_chains), idx(antigen_chains)
+    if not len(ab) or not len(ag):
+        return np.nan
+    return float(np.asarray(pae)[np.ix_(ab, ag)].min())
+
+
 def pair_iptm_scores(pair_iptm, chain_order, roles, antigen_chains):
     """Per-chain-pair ipTM for the Fv-versus-antigen pairs.
 
@@ -303,6 +325,20 @@ def _digest(chains):
     return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
+def config_tag(opts):
+    """Short hash of everything that changes what a fold produces.
+
+    Part of the cache filename, because the sequence hash alone is not a
+    sufficient key: switching checkpoint or sampling settings and re-running
+    would silently reuse the previous model's structures and report them as new
+    results -- the exact way you would wrongly conclude that a setting change
+    made no difference.
+    """
+    payload = '|'.join(str(opts.get(k)) for k in
+                       ('checkpoint', 'num_loops', 'num_sampling_steps', 'dtype'))
+    return hashlib.sha1(payload.encode()).hexdigest()[:6]
+
+
 def _fold_one(job, opts):
     """Fold one complex (or reuse a cached fold) and score its interface."""
     from diffab.tools.fold.base import FoldResult, FoldTask, check_af2_inputs
@@ -341,6 +377,8 @@ def _fold_one(job, opts):
     scores = aggregate_pairs(table, job['roles'], job['antigen'])
     scores.update(pair_iptm_scores(result.pair_iptm, result.chain_order,
                                    job['roles'], job['antigen']))
+    scores['pae_min_AbAg'] = interchain_pae_min(
+        result.pae, job['chains'], job['ab_chains'], job['antigen'])
     scores['ptm'] = result.ptm
     scores['iptm'] = result.iptm
 
@@ -447,7 +485,7 @@ def select_top(tasks, top_n, rank_by):
     return selected
 
 
-def build_jobs(tasks, arms, negative_seed, mismatch):
+def build_jobs(tasks, arms, negative_seed, mismatch, tag=''):
     """One fold job per (arm, design), with natives deduplicated per run."""
     jobs, seen_native = [], set()
     antigen_pool = {}
@@ -468,7 +506,7 @@ def build_jobs(tasks, arms, negative_seed, mismatch):
         if 'designs' in arms:
             jobs.append({
                 **common, 'key': ('designs', task.in_path),
-                'name': f'design_{_digest(seqs)}', 'chains': dict(seqs), 'seed': 0,
+                'name': f'design_{_digest(seqs)}{tag}', 'chains': dict(seqs), 'seed': 0,
                 'design_pdb': task.in_path, 'cdr_chain': task.residue_first[0],
                 'cdr_indices': cdr_indices(
                     mappings[task.residue_first[0]],
@@ -484,7 +522,7 @@ def build_jobs(tasks, arms, negative_seed, mismatch):
             ref_seqs, _ = chain_sequences(ref_model, task.ab_chains)
             jobs.append({
                 **common, 'key': ('native', run_dir(task)),
-                'name': f'native_{_digest(ref_seqs)}', 'chains': ref_seqs, 'seed': 0,
+                'name': f'native_{_digest(ref_seqs)}{tag}', 'chains': ref_seqs, 'seed': 0,
                 'design_pdb': None,
             })
 
@@ -509,7 +547,7 @@ def build_jobs(tasks, arms, negative_seed, mismatch):
                 )
             jobs.append({
                 **common, 'key': ('negative', task.in_path),
-                'name': f'negative_{_digest(neg)}', 'chains': neg, 'seed': 0,
+                'name': f'negative_{_digest(neg)}{tag}', 'chains': neg, 'seed': 0,
                 'design_pdb': None,
             })
     return jobs
@@ -602,7 +640,8 @@ def main():
         print('Nothing to score.')
         return
 
-    jobs = build_jobs(tasks, arms, args.negative_seed, args.negative == 'mismatch')
+    jobs = build_jobs(tasks, arms, args.negative_seed,
+                      args.negative == 'mismatch', '_' + config_tag(opts))
     print(f'Folding {len(jobs)} complexes for {len(tasks)} designs '
           f'({", ".join(arms)}), {args.workers} worker(s).')
 
