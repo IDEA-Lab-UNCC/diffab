@@ -381,7 +381,11 @@ def run_jobs(jobs, workers, opts, label):
     # One GPU per worker: ESMFold2 weights are loaded once per process and the
     # cards are not shared, unlike relax's fractional-GPU OpenMM tasks.
     remote = ray.remote(num_gpus=1, num_cpus=1)(_fold_many)
-    size = max(1, len(jobs) // workers)
+    # Small chunks, as in binding.py. Progress only prints when a chunk
+    # finishes, and one chunk per worker would mean silence for hours on a run
+    # this slow. Ray reuses worker processes across tasks and `_MODEL` is
+    # memoised per process, so extra chunks cost no extra weight loading.
+    size = max(1, len(jobs) // (workers * 4))
     chunks = [jobs[i:i + size] for i in range(0, len(jobs), size)]
     futures = [remote.remote(c, opts) for c in chunks]
     out = {}
