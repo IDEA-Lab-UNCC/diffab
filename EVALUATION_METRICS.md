@@ -41,6 +41,10 @@ generated structures.
 | `terms_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.rosetta_terms` |
 | `binding_per_design.csv` | `dG_int`, `dG_bind`, `fa_rep_bound` + `ref_`/delta; one row per design | `diffab.tools.eval.binding` |
 | `binding_summary.csv` | the same, averaged per `(method, structure, cdr)` | `diffab.tools.eval.binding` |
+| `binding_per_design_replicate.csv` | an independent second scoring of the same structures; the noise floor | `diffab.tools.eval.binding --layout flat`, copied in |
+| `compare_selected_k.csv` | select top-k by metric A, score on metric B; one row per `(cdr, A, B, k)` | `diffab.tools.eval.compare` |
+| `compare_random_k.csv` | best-of-k under random selection, with CI and noise floor | `diffab.tools.eval.compare` |
+| `compare_sequence.csv` | batch diversity, composition and developability liabilities | `diffab.tools.eval.compare` |
 | `peptide_bond_distribution.png` | bond-length histogram, one panel per CDR | `diffab.tools.eval.plot_geometry` |
 | `dG_distribution.png`, `dG_violin.png` | interface energy per CDR (`--metric` picks which) | `diffab.tools.eval.plot_energy` |
 | `interface_reference.csv` | per-residue contact distances for the reference structures | `diffab.tools.eval.interface` |
@@ -190,6 +194,56 @@ than by binding.
 Costs ~4.0 s per design, so ~9 min per 600 designs on 12 cores. `--workers 1`
 runs serially without Ray. Accepts the usual `--method` / `--structure` / `--cdr`
 filters and `--layout`.
+
+### 5b. Best-batch comparison of two runs
+
+```bash
+python -m diffab.tools.eval.compare --runs <baseline> <finetuned> --labels baseline finetuned --out <finetuned>
+```
+
+Answers a different question from every other runner here: **are the designs you
+would actually pick better?** Nobody assays 600 designs, so a model that lifts
+hopeless designs to merely-bad moves every mean in the table while being worth
+nothing, and a model that sharpens the top ten can look flat. Means cannot
+separate those; best-of-k can.
+
+| Flag | Effect |
+| --- | --- |
+| `--runs A B` | the two run directories, baseline first |
+| `--labels` | column names for the two arms |
+| `--replicates A.csv B.csv` | second scorings for the noise floor; defaults to `binding_per_design_replicate.csv`, `-` skips one |
+| `--ks` | batch sizes (default `1,5,10,25`) |
+| `--selectors` / `--evaluators` | metrics to rank by / to judge on |
+| `--no-sequence` | skip diversity and liabilities (they parse every PDB) |
+
+Three ideas do the work:
+
+- **Select by A, score on B, A ≠ B.** A model RL-trained on A will win any
+  comparison that ranks by A and reports A; that measures the training objective,
+  not the designs. Rows where `selector == evaluator` are kept but flagged
+  `circular` so they cannot be mistaken for evidence.
+- **A noise floor, not zero.** `dG_bind` is stochastic, and best-of-k takes a
+  *minimum*, so it preferentially picks whichever design got a lucky repack.
+  Measured on 7DK2, the replicate floor on best-of-10 `ddG_bind` is ~2 REU and on
+  best-of-1 ~12 REU. An effect is only called real when it clears both the
+  bootstrap CI and that floor. `dG_int` and the interface descriptors are
+  deterministic, with a measured floor of 0.
+- **Batch properties, not just per-design ones.** A top-10 of near-identical
+  sequences is one experiment, not ten, so `compare_sequence.csv` reports unique
+  count, mean pairwise Hamming, and clusters at Hamming ≤ 2, alongside
+  developability liabilities (N-glycosylation sequons, deamidation,
+  isomerisation, free Cys, oxidation) that decide whether a design is worth
+  making whatever it scores.
+
+`delta_*` follows one convention everywhere: **negative means the second arm is
+better**, whichever way the metric itself reads.
+
+To get a replicate, score a run a second time somewhere harmless and copy it in:
+
+```bash
+python -m diffab.tools.eval.binding --root <run> --layout flat --out /tmp/rep
+cp /tmp/rep/evaluation/binding_per_design.csv <run>/evaluation/binding_per_design_replicate.csv
+```
 
 ### 6. Energy distribution plots
 
@@ -759,9 +813,20 @@ approximately rather than exactly, but the unbound state is now allowed the
 reorganisation that genuinely accompanies unbinding — which is the correct
 physics `pack_separated=True` was designed to capture.
 
-Stochastic, but far less so than `dG_gen`: `sd ~0.25` REU on relaxed structures,
-so one sample per design suffices. Costs ~2.4 s per structure against 1.7 s for
-`dG_int`.
+Stochastic, and by more than was previously recorded here. Measured by scoring
+the same 600 relaxed 7DK2 structures twice: median run-to-run |difference|
+**0.60 REU**, p90 **3.0**, p99 **8.7**, with rare blow-ups past 100 REU on
+high-`fa_rep` structures where repacking is unstable. (An earlier version of this
+line claimed `sd ~0.25` REU and that one sample per design suffices; that was
+wrong.)
+
+It matters most for **best-of-k** statistics, which take a minimum and so
+preferentially select whichever design got a lucky repack — the replicate noise
+floor on best-of-10 `ddG_bind` is ~2 REU, and ~12 REU at k=1. Raise
+`--design-repeats` to average it down, and compare effects against a replicate
+rather than against zero (see [5b](#5b-best-batch-comparison-of-two-runs)).
+`dG_int` has no such problem: no packer runs, so re-scoring reproduces it
+exactly. Costs ~2.4 s per structure against 1.7 s for `dG_int`.
 
 ### `fa_rep_bound` — the strain your validity metrics cannot see
 
@@ -782,6 +847,40 @@ never generated. Designs with `fa_rep_bound` of 489 and 915 both have
 
 Baseline is ~517–532 for five CDRs (the shared, never-relaxed bulk of the
 structure). H_CDR3 reaches a median of 612 and a max of 1100.
+
+### Interface descriptors — the non-energy columns
+
+`InterfaceAnalyzerMover` computes these on the same call that yields `dG_int`,
+so they cost nothing; `binding.py` used to discard them. Each carries the usual
+`ref_` control and `delta_` difference.
+
+| Column | Meaning | Better |
+| --- | --- | --- |
+| `sc_value` | shape complementarity of the two surfaces, 0–1 | higher |
+| `dSASA_int` | buried interface area, Å² | higher |
+| `dSASA_hphobic`, `dSASA_polar` | its hydrophobic / polar split | *descriptive* |
+| `unsat_hbonds` | buried unsatisfied H-bonds (Rosetta's `delta_unsatHbonds`) | lower |
+| `hbonds_int` | H-bonds across the interface | higher |
+| `hbond_E_fraction` | share of the interface energy that is H-bonding | higher |
+| `nres_int` | residues in the interface | *descriptive* |
+| `dG_per_dSASA` | `dG_separated` per 100 Å² buried | lower |
+
+They earn their place by **not being energies**. `sc_value` grades geometric
+fit, so a design that lowers its score by shedding bulk — shrinking side chains
+until `fa_rep` falls — cannot raise it; real antibody–antigen interfaces sit at
+0.65–0.75, and 7DK2's native measures 0.62. `dG_per_dSASA` normalises by the
+area buried, so burying more surface stops being a free win. `unsat_hbonds` is
+the standard "is this interface satisfiable" filter. Read it alongside
+`dSASA_int`: fewer unsatisfied H-bonds in a *smaller* interface may be nothing
+more than less polar burial.
+
+`DIRECTION` in `binding.py` records which way each reads, including the two that
+are descriptive rather than graded — `compare.py` refuses to call those better or
+worse, and so should you.
+
+Renamed from Rosetta: `delta_unsatHbonds` → `unsat_hbonds`. Rosetta's `delta_`
+there means "bound minus separated", which collides with this module's `delta_`
+prefix, which always means "design minus native".
 
 ### Caveats
 

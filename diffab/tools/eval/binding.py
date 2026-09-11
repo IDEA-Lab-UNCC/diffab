@@ -27,14 +27,39 @@ state stays frozen in its bound conformation, so it overstates affinity.
 `dG_bind` -- packing on both sides. Both states get the same side-chain
 optimisation, so strain cancels approximately rather than exactly, but the
 unbound state is now allowed the reorganisation that really does accompany
-unbinding. Closer to a binding free energy; stochastic (sd ~0.25 REU on relaxed
-structures, so one sample per design is enough).
+unbinding. Closer to a binding free energy, but **stochastic, and much noisier
+than one sample per design can hide**. Measured by scoring the same 600 relaxed
+7DK2 structures twice: median run-to-run |difference| 0.60 REU, p90 3.0, p99 8.7,
+with rare blow-ups past 100 REU on high-`fa_rep` structures where repacking is
+unstable. (An earlier note here claimed sd ~0.25 REU; that is wrong.)
+
+This matters most for *best-of-k* statistics, which take a minimum and so
+preferentially select whichever design got a lucky repack: the replicate noise
+floor on best-of-10 `ddG_bind` reaches 1.9 REU, and 12 REU at k=1. Raise
+`--design-repeats` to average it down, and always compare an effect against a
+replicate rather than against zero. `dG_int` has no such problem -- no packer
+runs, so it is deterministic (replicate difference exactly 0.00).
 
 `fa_rep_bound` -- weighted all-atom repulsion of the bound complex. Not a
 binding term at all; it is recorded because it is what actually drives the
 spread in `dG_gen` (Spearman 0.72 within H_CDR3), and because the backbone-only
 `clash_n` in `validity_per_design.csv` is blind to it -- side-chain overlap is
 invisible to a backbone clash cutoff.
+
+Alongside those, the interface descriptors `InterfaceAnalyzerMover` computes on
+the very same call and this module used to discard: `sc_value` (shape
+complementarity), `dSASA_int` / `dSASA_hphobic` / `dSASA_polar` (buried area),
+`unsat_hbonds` (Rosetta's `delta_unsatHbonds`, renamed to free the `delta_`
+prefix), `hbonds_int`, `hbond_E_fraction`, `nres_int`, and `dG_per_dSASA`.
+
+They are worth having because they are **not energies**. `sc_value` grades the
+geometric fit of the two surfaces, so a design that lowers its score by shedding
+bulk -- shrinking side chains until `fa_rep` falls -- cannot raise it; real
+antibody-antigen interfaces sit at 0.65-0.75. `dG_per_dSASA` normalises the
+energy by the area it buries, so burying more surface stops being a free win.
+`unsat_hbonds` is the standard "is this interface actually satisfiable" filter.
+`DIRECTION` records which way each reads, including the three that are
+descriptive rather than graded.
 
 Nothing here touches `summary.csv`; output goes to `binding_per_design.csv` and
 `binding_summary.csv` beside the other evaluation artefacts.
@@ -64,12 +89,53 @@ REPORT_ORDER = (
     'dG_int',           # interaction energy, deterministic, strain-free
     'dG_bind',          # both states repacked; closer to a real dG
     'fa_rep_bound',     # all-atom steric strain of the complex
+    'sc_value',         # shape complementarity -- geometry, not energy
+    'dSASA_int',        # buried interface area, A^2
+    'dSASA_hphobic',
+    'dSASA_polar',
+    'unsat_hbonds',     # buried unsatisfied H-bonds
+    'hbonds_int',       # H-bonds across the interface
+    'hbond_E_fraction',
+    'nres_int',         # residues in the interface
+    'dG_per_dSASA',     # energy per unit buried area
 )
 
 DELTA_NAMES = {
     'dG_int': 'ddG_int',
     'dG_bind': 'ddG_bind',
     'fa_rep_bound': 'delta_fa_rep_bound',
+    **{name: 'delta_' + name for name in REPORT_ORDER[3:]},
+}
+
+# `InterfaceAnalyzerMover` field -> column name. The mover computes all of these
+# on the same call that yields `dG_int`, so they were already being paid for and
+# thrown away; taking them from the no-repack call also makes them deterministic,
+# unlike anything read off a `pack_*` call.
+#
+# Renamed: Rosetta's `delta_unsatHbonds` is a delta against the separated state,
+# not against the native, so keeping the name would collide with this module's
+# `delta_` prefix (which always means design minus native).
+DESCRIPTORS = {
+    'sc_value': 'sc_value',
+    'dSASA_int': 'dSASA_int',
+    'dSASA_hphobic': 'dSASA_hphobic',
+    'dSASA_polar': 'dSASA_polar',
+    'delta_unsatHbonds': 'unsat_hbonds',
+    'hbonds_int': 'hbonds_int',
+    'hbond_E_fraction': 'hbond_E_fraction',
+    'nres_int': 'nres_int',
+    'dG_separated/dSASAx100': 'dG_per_dSASA',
+}
+
+# Which way each column reads: -1 lower is better, +1 higher is better, 0 no
+# preferred direction. `compare.py` orients every table by this and refuses to
+# call a 0 column better or worse -- `dSASA_polar` and `nres_int` describe the
+# interface's composition and size, they do not grade it.
+DIRECTION = {
+    'dG_int': -1, 'dG_bind': -1, 'fa_rep_bound': -1,
+    'sc_value': +1, 'dSASA_int': +1, 'hbonds_int': +1, 'hbond_E_fraction': +1,
+    'unsat_hbonds': -1, 'dG_per_dSASA': -1,
+    'dSASA_hphobic': 0, 'dSASA_polar': 0, 'nres_int': 0,
 }
 
 _INITIALISED = False
@@ -113,16 +179,20 @@ def _interface_analyzer(interface):
         return mover
 
 
-def _dG_separated(pose):
-    """`dG_separated` from whichever score container this build exposes."""
+def _pose_scores(pose):
+    """Every mover output, from whichever score container this build exposes.
+
+    `Pose.scores` is deprecated in favour of `Pose.cache` in 2026 builds, so
+    `cache` is tried first and `scores` kept as the fallback.
+    """
     try:
-        return float(pose.cache['dG_separated'])
+        return dict(pose.cache)
     except AttributeError:
-        return float(pose.scores['dG_separated'])
+        return dict(pose.scores)
 
 
 def _apply(pdb_path, interface, pack_separated, pack_input):
-    """`dG_separated` under one choice of the two repacking flags.
+    """All `InterfaceAnalyzerMover` outputs under one choice of the two flags.
 
     The pose is reloaded per call: `pack_input=True` repacks in place, so a pose
     cannot be reused between settings.
@@ -133,7 +203,7 @@ def _apply(pdb_path, interface, pack_separated, pack_input):
     mover.set_pack_separated(pack_separated)
     mover.set_pack_input(pack_input)
     mover.apply(pose)
-    return _dG_separated(pose)
+    return _pose_scores(pose)
 
 
 def fa_rep_bound(pdb_path):
@@ -147,14 +217,22 @@ def fa_rep_bound(pdb_path):
 
 
 def score_structure(pdb_path, interface, repeats=1):
-    """The three recorded quantities for one PDB."""
-    dG_int = _apply(pdb_path, interface, False, False)
-    binds = [_apply(pdb_path, interface, True, True) for _ in range(repeats)]
-    return {
-        'dG_int': dG_int,
-        'dG_bind': sum(binds) / len(binds),
+    """The recorded quantities for one PDB: energies plus interface descriptors."""
+    unpacked = _apply(pdb_path, interface, False, False)
+    binds = [_apply(pdb_path, interface, True, True)['dG_separated']
+             for _ in range(repeats)]
+    out = {
+        'dG_int': float(unpacked['dG_separated']),
+        'dG_bind': sum(float(b) for b in binds) / len(binds),
         'fa_rep_bound': fa_rep_bound(pdb_path),
     }
+    # Descriptors come from the unpacked call so they describe the pose as
+    # relaxed, and inherit `dG_int`'s determinism. A field missing from an older
+    # PyRosetta build is skipped rather than written as NaN.
+    for field, column in DESCRIPTORS.items():
+        if field in unpacked:
+            out[column] = float(unpacked[field])
+    return out
 
 
 def interface_spec(task: EvalTask):
@@ -230,6 +308,12 @@ def main():
     parser.add_argument('--pfx', type=str, default='rosetta')
     parser.add_argument('--out', type=str, default=None)
     parser.add_argument('--layout', choices=('flat', 'per_run', 'both'), default='per_run')
+    parser.add_argument('--design-repeats', type=int, default=1,
+                        help='repacking samples averaged per design for dG_bind. '
+                             '1 leaves a noise floor of ~2 REU on best-of-10 '
+                             'statistics; raise it when comparing runs on dG_bind. '
+                             'Costs one InterfaceAnalyzer pass per extra repeat '
+                             'and does not affect the deterministic dG_int.')
     parser.add_argument('--workers', type=int, default=os.cpu_count() or 1,
                         help='processes to score with; 1 runs serially')
     add_selection_args(parser)
@@ -264,7 +348,8 @@ def main():
         ref_jobs.append((key, task.ref_path, specs[run_dir(task)], REF_REPEATS))
 
     design_jobs = [
-        (task.in_path, task.in_path, specs[run_dir(task)], 1) for task in tasks
+        (task.in_path, task.in_path, specs[run_dir(task)], args.design_repeats)
+        for task in tasks
     ]
 
     print(f'Found {len(tasks)} structures, {len(design_jobs)} designs and '
