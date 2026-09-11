@@ -98,6 +98,58 @@ every `ddG_*`-selected / `ddG_*`-evaluated cell is measuring the reward.
 deterministic columns (`ddG_int` and every interface descriptor) have a measured
 floor of exactly 0 and need no such check.
 
+### What the evaluators mean
+
+Six metrics are compared by default. They are not six views of one thing — each
+answers a different question, and a design can pass one while failing another.
+Native 7DK2 values are given as the yardstick, since an absolute number here
+means little on its own.
+
+| Evaluator | Question it answers | Native 7DK2 |
+| --- | --- | --- |
+| `ddG_int` | Do the two surfaces attract, in the pose as given? | −33 to −45 REU |
+| `ddG_bind` | What survives once both sides are allowed to relax? | −0.7 to −21 REU |
+| `sc_value` | Do the two surfaces physically *fit*? | 0.60 – 0.66 |
+| `dSASA_int` | How much surface does the interface bury? | 2460 – 2540 Å² |
+| `unsat_hbonds` | How many buried polar groups get no partner? | 19 – 27 |
+| `dG_per_dSASA` | Is the interface *efficient* per unit area? | −1.33 to −1.81 |
+
+**`ddG_int` — interaction energy.** Both partners frozen in their bound
+conformation, so every one-body and intra-chain term cancels exactly and only
+the genuine inter-chain terms survive. Strain-free and deterministic. It
+*overstates* affinity, because a real antibody pays to hold itself in the bound
+conformation and this never charges for it.
+
+**`ddG_bind` — closer to a free energy.** Both states repacked, so the unbound
+state gets the side-chain reorganisation that really does accompany unbinding.
+The better physical quantity, and the noisier one — see the selector table below.
+
+**`sc_value` — shape complementarity.** Purely geometric: how well the two
+surfaces interdigitate, 0 (flat against knobbly) to 1 (perfect cast). **The key
+property is that it is not an energy**, so a design cannot raise it by shrinking
+its side chains until `fa_rep` falls — the trick that lowers every Rosetta
+energy. Real antibody–antigen interfaces sit at 0.65–0.75; below ~0.55 the
+surfaces are not really in contact.
+
+**`dSASA_int` — buried interface area.** Total surface occluded on forming the
+complex, across both partners. Bigger interfaces generally bind harder, so this
+is read as *more is better* — but only alongside `dG_per_dSASA`, because burying
+more surface badly is not an improvement. A drop here across a whole batch means
+the model is designing physically smaller interfaces.
+
+**`unsat_hbonds` — buried unsatisfied hydrogen bonds.** Polar atoms driven out
+of water and into the interface without finding a partner. Each one is a real
+energetic penalty (roughly 1–2 kcal/mol) and a standard filter in designed
+binders. **Read it next to `dSASA_int`**: fewer unsatisfied H-bonds in a smaller
+interface may be nothing more than less polar burial, not a better-satisfied one.
+Dividing by `dSASA_int` separates the two.
+
+**`dG_per_dSASA` — energy density.** `dG_separated` per 100 Å² buried. It exists
+to close the loophole in raw energy: a design can improve `ddG_int` simply by
+burying more surface, which this normalises away. A design that gets better on
+`ddG_int` while getting worse here bought its energy with area, not with a better
+interface.
+
 ### Choosing a selector
 
 `ddG_int` and `ddG_bind` are both defaults, but they are not interchangeable as
@@ -225,3 +277,83 @@ The intended workflow:
 
 A batch that improves on the energy it was selected by, while its clusters
 collapse and its sequons multiply, has not improved.
+
+---
+
+## Worked example: 7DK2, top-5 by `ddG_bind`
+
+Baseline (`7DK2_AB_C.pdb_2_relax`, stock `codesign_single.pt`) against DDPO
+fine-tuned (`7DK2_AB_C.pdb_2026_09_02__16_28_52`, `round_0200.pt`), both relaxed
+at `-relax:default_repeats 2`. Shortlist = the 5 best per CDR by `ddG_bind`.
+
+**Read the caveat first.** `ddG_bind` is a poor selector at this k. Re-scoring
+the identical structures and re-ranking preserves only **0–4 of the 5**
+(median 2/5):
+
+```
+baseline   H_CDR1 2/5  H_CDR2 2/5  H_CDR3 4/5  L_CDR1 2/5  L_CDR2 1/5  L_CDR3 3/5
+finetuned  H_CDR1 2/5  H_CDR2 2/5  H_CDR3 4/5  L_CDR1 3/5  L_CDR2 0/5  L_CDR3 4/5
+```
+
+More than half of this shortlist is a lottery over repacking noise. Rank on
+`ddG_int` (10/10 stable), or raise `--design-repeats`, before trusting a top-5
+picked this way.
+
+### What is significant
+
+Of 30 non-circular cells (6 CDRs × 5 evaluators), **five** clear the CI on the
+batch mean — four of them *worse*:
+
+| CDR | Evaluator | baseline | fine-tuned | Δ | |
+| --- | --- | --- | --- | --- | --- |
+| L_CDR2 | `ddG_int` | 0.52 | 5.70 | **+5.18** | worse |
+| L_CDR2 | `dG_per_dSASA` | −1.667 | −1.490 | **+0.177** | worse |
+| L_CDR1 | `dSASA_int` | 2548.9 | 2491.4 | **−57.5** | worse |
+| L_CDR1 | `unsat_hbonds` | 25.8 | 23.6 | **−2.2** | better |
+| H_CDR3 | `ddG_bind` | +4.25 | −4.23 | −8.48 | *circular* |
+
+Everything else is `ns` — at k=5 the CIs are wide, so small effects cannot be
+resolved. **L_CDR2 is the clear loser**: worse interaction energy *and* worse
+energy density, i.e. it did not simply trade area for energy. **L_CDR1's fewer
+unsatisfied H-bonds come with a significantly smaller interface**, which is
+exactly the confound the two columns are meant to expose — 23.6/2491 is 9.5 per
+1000 Å² against 25.8/2549 = 10.1, so a little over half the gain is real and the
+rest is less polar burial. H_CDR3's large `ddG_bind` win is the arm the model was
+trained on and is also the selector here, so it is doubly circular.
+
+`sc_value` moves nowhere significant in any CDR, staying at 0.585–0.652 against a
+native 0.60–0.66. Geometric fit is unchanged by fine-tuning.
+
+### What the sequences say
+
+| | H_CDR1 | H_CDR2 | H_CDR3 | L_CDR1 | L_CDR2 | L_CDR3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| clusters, base → ft | 1→1 | **5→1** | 5→5 | 2→2 | 1→1 | 1→3 |
+| mean Hamming | 1.2→1.2 | **4.7→1.9** | 9.7→9.5 | 2.6→2.5 | 1.2→0.8 | 2.3→3.5 |
+| aromatic frac | .43→.43 | .10→.07 | **.20→.09** | **.09→.02** | 0→0 | .29→.20 |
+| small (G/A/S) frac | .37→.43 | .63→.83 | .42→.56 | .45→.56 | .63→.80 | .09→.27 |
+
+**H_CDR2's shortlist collapses from 5 distinct designs to 1.** Five sequences
+within Hamming 2 of each other is one experiment wearing five coats — the single
+most important thing in this table for anyone deciding what to synthesise, and
+invisible to every energy column.
+
+Aromatics fall in four of six CDRs while small residues rise in all six.
+Aromatics are the workhorses of real paratopes, so this is the signature of a
+model buying score by shrinking the CDR.
+
+Liabilities get worse, not better:
+
+- **H_CDR2 `n_glyc` 0.6 → 1.0** — *all five* fine-tuned designs carry an
+  N-glycosylation sequon. The native has none.
+- H_CDR3 oxidation 0.2 → 0.6, L_CDR3 oxidation 0.0 → 0.6, H_CDR2 0.0 → 0.4.
+- H_CDR3 picks up a sequon (0.0 → 0.2).
+
+### Verdict
+
+On the shortlist you would actually take, fine-tuning did not deliver. One CDR
+is significantly worse on two independent measures, one shows a partly-real
+H-bond gain bought with a smaller interface, shape complementarity is unmoved,
+H_CDR2's five candidates collapse to one, and every one of them carries a
+glycosylation sequon the native does not. The only large win is on `ddG_bind`,
+which is both the training objective and the selector.
